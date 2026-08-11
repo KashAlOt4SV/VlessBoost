@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -15,7 +16,13 @@ from app import __version__
 
 logger = logging.getLogger(__name__)
 
-MANIFEST_URL = "https://cdn.jsdelivr.net/gh/KashAlOt4SV/VlessBoost@main/update/version.json"
+# Dual-fetch: raw GitHub (short cache) + jsDelivr (often stale on @main).
+# Keep first URL as the preferred source; pick the newer windows.version.
+MANIFEST_URLS = (
+    "https://raw.githubusercontent.com/KashAlOt4SV/VlessBoost/main/update/version.json",
+    "https://cdn.jsdelivr.net/gh/KashAlOt4SV/VlessBoost@main/update/version.json",
+)
+MANIFEST_URL = MANIFEST_URLS[0]
 
 
 @dataclass
@@ -34,22 +41,50 @@ def _parse_ver(v: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
-def check_windows_update(current: str | None = None) -> WindowsUpdate | None:
-    cur = current or __version__
+def _fetch_manifest(url: str) -> dict | None:
+    bust = f"{url}{'&' if '?' in url else '?'}t={int(time.time())}"
+    req = urllib.request.Request(
+        bust,
+        headers={
+            "User-Agent": "VLESS-Boost-Updater/1.1",
+            "Cache-Control": "no-cache",
+            "Accept": "application/json",
+        },
+    )
     try:
-        with urllib.request.urlopen(MANIFEST_URL, timeout=12) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
-        logger.warning("update check failed: %s", exc)
+        logger.warning("update manifest failed (%s): %s", url, exc)
         return None
+
+
+def _windows_from_manifest(data: dict) -> WindowsUpdate | None:
     win = data.get("windows") or {}
     remote = str(win.get("version") or "").strip()
     url = str(win.get("url") or "").strip()
     if not remote or not url:
         return None
-    if _parse_ver(remote) <= _parse_ver(cur):
-        return None
     return WindowsUpdate(version=remote, url=url)
+
+
+def check_windows_update(current: str | None = None) -> WindowsUpdate | None:
+    cur = current or __version__
+    best: WindowsUpdate | None = None
+    for manifest_url in MANIFEST_URLS:
+        data = _fetch_manifest(manifest_url)
+        if not data:
+            continue
+        cand = _windows_from_manifest(data)
+        if not cand:
+            continue
+        if best is None or _parse_ver(cand.version) > _parse_ver(best.version):
+            best = cand
+    if best is None:
+        return None
+    if _parse_ver(best.version) <= _parse_ver(cur):
+        return None
+    return best
 
 
 def download_file(url: str, dest: Path) -> Path:

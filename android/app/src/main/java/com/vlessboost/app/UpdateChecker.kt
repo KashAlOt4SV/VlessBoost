@@ -7,10 +7,16 @@ import java.net.URL
 
 /**
  * Простые обновления по URL version.json.
+ * Dual-fetch: raw GitHub + jsDelivr, берём более новый versionCode.
  */
 object UpdateChecker {
+    val MANIFEST_URLS = listOf(
+        "https://raw.githubusercontent.com/KashAlOt4SV/VlessBoost/main/update/version.json",
+        "https://cdn.jsdelivr.net/gh/KashAlOt4SV/VlessBoost@main/update/version.json",
+    )
+
     const val MANIFEST_URL =
-        "https://cdn.jsdelivr.net/gh/KashAlOt4SV/VlessBoost@main/update/version.json"
+        "https://raw.githubusercontent.com/KashAlOt4SV/VlessBoost/main/update/version.json"
 
     data class AndroidUpdate(
         val versionCode: Int,
@@ -25,32 +31,50 @@ object UpdateChecker {
     }
 
     fun checkAndroidDetailed(currentCode: Int): CheckResult {
-        val root = fetchManifest()
-            ?: return CheckResult.Failed("Не удалось скачать version.json")
-        val android = root.optJSONObject("android")
-            ?: return CheckResult.Failed("В version.json нет блока android")
-        val code = android.optInt("versionCode", 0)
-        val name = android.optString("versionName", "")
-        val url = android.optString("url", "")
-        if (url.isBlank()) {
-            return CheckResult.Failed("В version.json пустой url")
+        var best: AndroidUpdate? = null
+        var lastError: String? = null
+        for (base in MANIFEST_URLS) {
+            val root = fetchManifest(base)
+            if (root == null) {
+                lastError = "Не удалось скачать version.json"
+                continue
+            }
+            val android = root.optJSONObject("android")
+            if (android == null) {
+                lastError = "В version.json нет блока android"
+                continue
+            }
+            val code = android.optInt("versionCode", 0)
+            val name = android.optString("versionName", "")
+            val url = android.optString("url", "")
+            if (url.isBlank()) {
+                lastError = "В version.json пустой url"
+                continue
+            }
+            if (code <= 0) {
+                lastError = "Некорректный versionCode в version.json"
+                continue
+            }
+            val cand = AndroidUpdate(code, name, url)
+            if (best == null || cand.versionCode > best.versionCode) {
+                best = cand
+            }
         }
-        if (code <= 0) {
-            return CheckResult.Failed("Некорректный versionCode в version.json")
+        val remote = best
+            ?: return CheckResult.Failed(lastError ?: "Не удалось скачать version.json")
+        if (remote.versionCode <= currentCode) {
+            return CheckResult.UpToDate(currentCode, remote.versionCode, remote.versionName)
         }
-        if (code <= currentCode) {
-            return CheckResult.UpToDate(currentCode, code, name)
-        }
-        return CheckResult.Available(AndroidUpdate(code, name, url))
+        return CheckResult.Available(remote)
     }
 
     /** @deprecated используйте checkAndroidDetailed */
     fun checkAndroid(currentCode: Int): AndroidUpdate? =
         (checkAndroidDetailed(currentCode) as? CheckResult.Available)?.update
 
-    private fun fetchManifest(): JSONObject? {
+    private fun fetchManifest(baseUrl: String): JSONObject? {
         return try {
-            val url = URL("$MANIFEST_URL?t=${System.currentTimeMillis()}")
+            val url = URL("$baseUrl?t=${System.currentTimeMillis()}")
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 connectTimeout = 10000
                 readTimeout = 15000
@@ -62,14 +86,14 @@ object UpdateChecker {
             }
             val code = conn.responseCode
             if (code !in 200..299) {
-                Log.w("UpdateChecker", "HTTP $code")
+                Log.w("UpdateChecker", "HTTP $code from $baseUrl")
                 return null
             }
             conn.inputStream.bufferedReader().use { reader ->
                 JSONObject(reader.readText())
             }
         } catch (e: Exception) {
-            Log.w("UpdateChecker", "manifest: ${e.message}")
+            Log.w("UpdateChecker", "manifest ($baseUrl): ${e.message}")
             null
         }
     }
