@@ -7,6 +7,7 @@ from typing import Callable
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 import pystray
+import tkinter as tk
 from tkinter import messagebox
 
 from app.config_builder import collect_routes
@@ -84,6 +85,147 @@ def ghost_btn(master, text: str, command, *, width=110, height=36, **kw) -> ctk.
     }
     opts.update(kw)
     return ctk.CTkButton(master, text=text, command=command, **opts)
+
+
+def enable_text_clipboard(widget) -> None:
+    """Make Ctrl+V/C/X/A and right-click paste work on CTk Entry/Textbox (Windows + RU layout).
+
+    CustomTkinter wraps tk Entry/Text; with a Russian keyboard layout Ctrl+V often
+    arrives as keysym ``м`` (same physical key), so the stock ``<Control-v>`` binding
+    never fires. We handle Windows virtual-key codes (layout-independent) and
+    Cyrillic keysyms explicitly.
+    """
+    target = getattr(widget, "_textbox", None) or getattr(widget, "_entry", None) or widget
+    is_text = str(target.winfo_class()) == "Text"
+
+    def _get_clip() -> str:
+        try:
+            return target.clipboard_get()
+        except tk.TclError:
+            return ""
+
+    def _has_selection() -> bool:
+        if is_text:
+            return bool(target.tag_ranges("sel"))
+        try:
+            return bool(target.selection_present())
+        except tk.TclError:
+            return False
+
+    def _delete_selection() -> None:
+        if not _has_selection():
+            return
+        try:
+            target.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+
+    def do_paste(_event=None):
+        data = _get_clip()
+        if not data:
+            return "break"
+        _delete_selection()
+        try:
+            target.insert("insert", data)
+        except tk.TclError:
+            pass
+        return "break"
+
+    def do_copy(_event=None):
+        if not _has_selection():
+            return "break"
+        try:
+            data = target.get("sel.first", "sel.last") if is_text else target.selection_get()
+            target.clipboard_clear()
+            target.clipboard_append(data)
+        except tk.TclError:
+            pass
+        return "break"
+
+    def do_cut(event=None):
+        do_copy(event)
+        _delete_selection()
+        return "break"
+
+    def do_select_all(_event=None):
+        try:
+            if is_text:
+                target.tag_add("sel", "1.0", "end-1c")
+                target.mark_set("insert", "1.0")
+                target.see("insert")
+            else:
+                target.select_range(0, "end")
+                target.icursor("end")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def on_ctrl_key(event):
+        # Windows VK_* are stable across keyboard layouts (V=0x56, C=0x43, X=0x58, A=0x41).
+        # Skip when Latin keysym already matched a more specific <Control-v> binding.
+        ks = (getattr(event, "keysym", None) or "").lower()
+        if ks in ("v", "c", "x", "a"):
+            return None
+        code = getattr(event, "keycode", None)
+        if code == 86:
+            return do_paste(event)
+        if code == 67:
+            return do_copy(event)
+        if code == 88:
+            return do_cut(event)
+        if code == 65:
+            return do_select_all(event)
+        return None
+
+    # Latin + virtual <<Paste>> (Shift-Insert / OS paste)
+    for seq, handler in (
+        ("<Control-v>", do_paste),
+        ("<Control-V>", do_paste),
+        ("<Control-Shift-v>", do_paste),
+        ("<Control-Shift-V>", do_paste),
+        ("<<Paste>>", do_paste),
+        ("<Control-c>", do_copy),
+        ("<Control-C>", do_copy),
+        ("<<Copy>>", do_copy),
+        ("<Control-x>", do_cut),
+        ("<Control-X>", do_cut),
+        ("<<Cut>>", do_cut),
+        ("<Control-a>", do_select_all),
+        ("<Control-A>", do_select_all),
+    ):
+        target.bind(seq, handler)
+
+    # Russian layout: physical V/C/X/A → м/с/ч/ф
+    for seq, handler in (
+        ("<Control-м>", do_paste),
+        ("<Control-М>", do_paste),
+        ("<Control-с>", do_copy),
+        ("<Control-С>", do_copy),
+        ("<Control-ч>", do_cut),
+        ("<Control-Ч>", do_cut),
+        ("<Control-ф>", do_select_all),
+        ("<Control-Ф>", do_select_all),
+    ):
+        target.bind(seq, handler)
+
+    # Layout-independent fallback (covers odd keysyms Tk may emit under Ctrl)
+    target.bind("<Control-KeyPress>", on_ctrl_key)
+
+    menu = tk.Menu(target, tearoff=0)
+    menu.add_command(label="Вставить", command=lambda: do_paste())
+    menu.add_command(label="Копировать", command=lambda: do_copy())
+    menu.add_command(label="Вырезать", command=lambda: do_cut())
+    menu.add_separator()
+    menu.add_command(label="Выделить всё", command=lambda: do_select_all())
+
+    def show_menu(event):
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    target.bind("<Button-3>", show_menu)
 
 
 def danger_btn(master, text: str, command, *, width=140, height=42, **kw) -> ctk.CTkButton:
@@ -522,6 +664,7 @@ class BoosterApp(ctk.CTk):
         )
         search.pack(side="left")
         search.bind("<KeyRelease>", self._on_search_typed)
+        enable_text_clipboard(search)
 
         self.cat_var = ctk.StringVar(value="Все")
         ctk.CTkOptionMenu(
@@ -761,6 +904,7 @@ class BoosterApp(ctk.CTk):
         )
         self.vless_box.pack(fill="x", pady=(0, 8))
         self.vless_box.insert("1.0", self.settings.vless_url)
+        enable_text_clipboard(self.vless_box)
 
         ping_row = ctk.CTkFrame(inner, fg_color="transparent")
         ping_row.pack(fill="x", pady=(0, 14))
@@ -822,6 +966,7 @@ class BoosterApp(ctk.CTk):
         )
         self.custom_domains.pack(fill="x")
         self.custom_domains.insert("1.0", "\n".join(self.settings.custom_domains))
+        enable_text_clipboard(self.custom_domains)
 
         ctk.CTkLabel(
             inner,
@@ -846,6 +991,7 @@ class BoosterApp(ctk.CTk):
         )
         self.custom_procs.pack(fill="x")
         self.custom_procs.insert("1.0", "\n".join(self.settings.custom_processes))
+        enable_text_clipboard(self.custom_procs)
 
         btns = ctk.CTkFrame(inner, fg_color="transparent")
         btns.pack(fill="x", pady=(18, 0))
@@ -1087,6 +1233,7 @@ class BoosterApp(ctk.CTk):
             "Рекомендуем обновить списки один раз после установки.\n"
             "Общий список блокировок большой — включайте его только если нужно.\n",
         )
+        enable_text_clipboard(self.lists_log)
 
     def _update_lists(self, only: list[str] | None = None) -> None:
         if self._busy:
@@ -1151,6 +1298,7 @@ class BoosterApp(ctk.CTk):
             font=ctk.CTkFont(family="Consolas", size=12),
         )
         self.app_logs.pack(fill="both", expand=True)
+        enable_text_clipboard(self.app_logs)
 
     def _refresh_logs(self) -> None:
         from app.paths import LOG_PATH
@@ -1222,6 +1370,7 @@ class BoosterApp(ctk.CTk):
             "Проверка идёт по version.json в интернете.\n"
             "Если найдётся новая версия — скачается exe и предложит установить.\n",
         )
+        enable_text_clipboard(self.update_log)
 
     def _check_app_update(self) -> None:
         if self._busy:
