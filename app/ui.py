@@ -288,6 +288,8 @@ class BoosterApp(ctk.CTk):
         self._busy = False
         self._tray: pystray.Icon | None = None
         self._search_after: str | None = None
+        self._status_blink_after: str | None = None
+        self._status_blink_bright = True
         self._logo_refs: list = []
         self._icons: dict[str, ctk.CTkImage] = {}
         self._items: dict[str, ServiceCard | ServiceRow] = {}
@@ -916,6 +918,7 @@ class BoosterApp(ctk.CTk):
             return
         if not external or self.manager.running:
             return
+        self._stop_status_blink()
         pids = ", ".join(str(p) for p, _ in external)
         self.status_lbl.configure(
             text=f"⚠ Зависший sing-box (pid {pids})",
@@ -1355,9 +1358,38 @@ class BoosterApp(ctk.CTk):
             messagebox.showerror("Ошибка", str(exc), parent=self)
         self._refresh_status()
 
+    def _stop_status_blink(self) -> None:
+        if self._status_blink_after is not None:
+            try:
+                self.after_cancel(self._status_blink_after)
+            except Exception:
+                pass
+            self._status_blink_after = None
+        self._status_blink_bright = True
+
+    def _tick_status_blink(self) -> None:
+        self._status_blink_after = None
+        if not self.manager.running:
+            return
+        self._status_blink_bright = not self._status_blink_bright
+        # Clear blink: full green ↔ dim green on the ● only (label keeps "● Включено")
+        color = COLORS["ok"] if self._status_blink_bright else "#1A6B4A"
+        try:
+            self.status_lbl.configure(text_color=color)
+        except Exception:
+            return
+        self._status_blink_after = self.after(750, self._tick_status_blink)
+
+    def _start_status_blink(self) -> None:
+        if self._status_blink_after is not None:
+            return
+        self._status_blink_bright = True
+        self._status_blink_after = self.after(750, self._tick_status_blink)
+
     def _refresh_status(self) -> None:
         if self.manager.running:
             self.status_lbl.configure(text="● Включено", text_color=COLORS["ok"])
+            self._start_status_blink()
             self.boost_btn.configure(
                 text="Выключить",
                 fg_color=COLORS["danger"],
@@ -1365,6 +1397,7 @@ class BoosterApp(ctk.CTk):
                 text_color="#FFFFFF",
             )
         elif self.manager.has_external_instance():
+            self._stop_status_blink()
             pids = ", ".join(str(p) for p, _ in self.manager.external_instances())
             self.status_lbl.configure(
                 text=f"⚠ Зависший sing-box ({pids})",
@@ -1377,6 +1410,7 @@ class BoosterApp(ctk.CTk):
                 text_color="#061018",
             )
         else:
+            self._stop_status_blink()
             self.status_lbl.configure(text="○ Выключено", text_color=COLORS["muted"])
             self.boost_btn.configure(
                 text="Включить",
@@ -1387,6 +1421,7 @@ class BoosterApp(ctk.CTk):
 
     def _maybe_admin_prompt(self) -> None:
         if not is_admin():
+            self._stop_status_blink()
             self.status_lbl.configure(
                 text="Нужен запуск от администратора",
                 text_color=COLORS["accent"],
