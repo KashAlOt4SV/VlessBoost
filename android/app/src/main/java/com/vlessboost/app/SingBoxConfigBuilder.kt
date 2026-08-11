@@ -129,7 +129,7 @@ object SingBoxConfigBuilder {
             put("type", "tun")
             put("tag", "tun-in")
             put("address", JSONArray().put("172.19.0.1/30"))
-            put("mtu", 9000)
+            put("mtu", 1500)
             put("auto_route", true)
             put("strict_route", false)
             // system stack стабильнее на Android VpnService

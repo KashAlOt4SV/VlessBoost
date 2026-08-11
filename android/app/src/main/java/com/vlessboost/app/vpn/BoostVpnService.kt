@@ -111,6 +111,8 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         Seq.touch()
         Libbox.touch()
 
+        DefaultNetworkMonitor.start(this@BoostVpnService)
+
         stopLogClient()
         runCatching { commandServer?.closeService() }
         runCatching { commandServer?.close() }
@@ -194,6 +196,7 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         commandServer = null
         runCatching { tunPfd?.close() }
         tunPfd = null
+        DefaultNetworkMonitor.stop()
         isRunning = false
         broadcastStatus(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -257,6 +260,16 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             builder.setMetered(false)
+        }
+
+        // Физическая сеть под VPN — иначе outbound не знает куда биндиться
+        DefaultNetworkMonitor.underlying?.let { net ->
+            try {
+                builder.setUnderlyingNetworks(arrayOf(net))
+                LogStore.append("underlying network set")
+            } catch (e: Exception) {
+                LogStore.append("setUnderlyingNetworks: ${e.message}")
+            }
         }
 
         val inet4Address = options.inet4Address
@@ -374,7 +387,24 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         destinationAddress: String?,
         destinationPort: Int,
     ): ConnectionOwner {
-        throw UnsupportedOperationException("findConnectionOwner")
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            throw UnsupportedOperationException("findConnectionOwner needs API 29+")
+        }
+        val cm = getSystemService(android.net.ConnectivityManager::class.java)
+        val uid = cm.getConnectionOwnerUid(
+            ipProtocol,
+            java.net.InetSocketAddress(sourceAddress, sourcePort),
+            java.net.InetSocketAddress(destinationAddress, destinationPort),
+        )
+        if (uid == android.os.Process.INVALID_UID) {
+            throw IllegalStateException("connection owner not found")
+        }
+        val packages = packageManager.getPackagesForUid(uid)
+        return ConnectionOwner().apply {
+            userId = uid
+            userName = packages?.firstOrNull().orEmpty()
+            setAndroidPackageNames(StringArray(packages?.toList()?.iterator() ?: emptyList<String>().iterator()))
+        }
     }
 
     override fun getInterfaces(): NetworkInterfaceIterator {
@@ -385,7 +415,10 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             val caps = cm.getNetworkCapabilities(network) ?: continue
             val lp = cm.getLinkProperties(network) ?: continue
             if (!caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+            // Не отдаём сам VPN/tun — иначе auto_detect зациклится
+            if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) continue
             val name = lp.interfaceName ?: continue
+            if (name.startsWith("tun") || name.startsWith("ppp") || name.startsWith("wg")) continue
             val javaNif = javaNifs.find { it.name == name } ?: continue
             val box = NetworkInterface()
             box.name = name
@@ -397,16 +430,20 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                 caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) -> Libbox.InterfaceTypeEthernet
                 else -> Libbox.InterfaceTypeOther
             }
+            // IFF_UP | IFF_RUNNING
+            box.flags = 0x1 or 0x40
             box.addresses = StringArray(
-                javaNif.interfaceAddresses.map { ia ->
-                    val host = ia.address.hostAddress ?: return@map null
+                javaNif.interfaceAddresses.mapNotNull { ia ->
+                    val host = ia.address.hostAddress ?: return@mapNotNull null
+                    // skip IPv6 link-local noise if needed — keep all
                     "$host/${ia.networkPrefixLength}"
-                }.filterNotNull().iterator(),
+                }.iterator(),
             )
             box.dnsServer = StringArray(lp.dnsServers.mapNotNull { it.hostAddress }.iterator())
             box.metered = !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
             list.add(box)
         }
+        LogStore.append("getInterfaces count=${list.size}: ${list.joinToString { it.name }}")
         return object : NetworkInterfaceIterator {
             private val it = list.iterator()
             override fun hasNext(): Boolean = it.hasNext()
@@ -414,8 +451,15 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         }
     }
 
-    override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener?) {}
-    override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener?) {}
+    override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener?) {
+        LogStore.append("startDefaultInterfaceMonitor")
+        DefaultNetworkMonitor.start(this)
+        DefaultNetworkMonitor.setListener(listener)
+    }
+
+    override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener?) {
+        DefaultNetworkMonitor.setListener(null)
+    }
     override fun startNeighborMonitor(listener: NeighborUpdateListener?) {}
     override fun closeNeighborMonitor(listener: NeighborUpdateListener?) {}
     override fun readWIFIState(): WIFIState? = null
