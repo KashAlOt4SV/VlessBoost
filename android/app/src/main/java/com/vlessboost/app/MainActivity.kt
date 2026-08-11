@@ -207,25 +207,46 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun checkUpdate() {
-        Toast.makeText(this, "Проверка обновлений…", Toast.LENGTH_SHORT).show()
+        Toast.makeText(
+            this,
+            "Проверка… (сейчас v${BuildConfig.VERSION_NAME}, code ${BuildConfig.VERSION_CODE})",
+            Toast.LENGTH_SHORT,
+        ).show()
         scope.launch {
-            val update = withContext(Dispatchers.IO) {
-                UpdateChecker.checkAndroid(BuildConfig.VERSION_CODE)
+            val result = withContext(Dispatchers.IO) {
+                UpdateChecker.checkAndroidDetailed(BuildConfig.VERSION_CODE)
             }
-            if (update == null) {
-                Toast.makeText(
-                    this@MainActivity,
-                    "Обновлений нет (v${BuildConfig.VERSION_NAME})",
-                    Toast.LENGTH_SHORT,
-                ).show()
-                return@launch
+            when (result) {
+                is UpdateChecker.CheckResult.Available -> {
+                    val update = result.update
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Доступно обновление ${update.versionName}")
+                        .setMessage(
+                            "У вас: ${BuildConfig.VERSION_NAME} (code ${BuildConfig.VERSION_CODE})\n" +
+                                "Новая: ${update.versionName} (code ${update.versionCode})\n\n" +
+                                "Скачать и установить?",
+                        )
+                        .setPositiveButton("Скачать") { _, _ ->
+                            downloadApk(update.url, update.versionName)
+                        }
+                        .setNegativeButton("Позже", null)
+                        .show()
+                }
+                is UpdateChecker.CheckResult.UpToDate -> {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Обновлений нет. У вас code ${result.currentCode}, на сервере ${result.remoteCode} (${result.remoteName})",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                is UpdateChecker.CheckResult.Failed -> {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Ошибка проверки: ${result.reason}",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
             }
-            AlertDialog.Builder(this@MainActivity)
-                .setTitle("Доступно обновление ${update.versionName}")
-                .setMessage("Скачать и установить?")
-                .setPositiveButton("Скачать") { _, _ -> downloadApk(update.url, update.versionName) }
-                .setNegativeButton("Позже", null)
-                .show()
         }
     }
 
