@@ -111,7 +111,7 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         Seq.touch()
         Libbox.touch()
 
-        DefaultNetworkMonitor.setUpdatesEnabled(false)
+        // Monitor только для setUnderlyingNetworks — без Go updateDefaultInterface (Wi‑Fi crash).
         DefaultNetworkMonitor.start(this@BoostVpnService)
 
         stopLogClient()
@@ -132,9 +132,8 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         server.startOrReloadService(config, override)
         LogStore.append("service started / reloaded (after openTun)")
         isRunning = true
-        // Только теперь пушим default iface в Go — иначе гонка с openTun убивает процесс.
         DefaultNetworkMonitor.setUpdatesEnabled(true)
-        LogStore.append("post-start: monitor updates armed")
+        LogStore.append("post-start: underlying-only monitor (no Go iface push)")
         delay(300)
         startLogClient()
         LogStore.append("post-start: log client done, still alive")
@@ -270,11 +269,20 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                 builder.setMetered(false)
             }
 
-            // Физическая сеть под VPN — иначе outbound не знает куда биндиться
+            // Физическая сеть под VPN — иначе outbound не знает куда биндиться.
+            // Это наш Wi‑Fi/LTE uplink path вместо Libbox.updateDefaultInterface.
             DefaultNetworkMonitor.underlying?.let { net ->
                 try {
                     builder.setUnderlyingNetworks(arrayOf(net))
-                    LogStore.append("underlying network set")
+                    val caps = getSystemService(android.net.ConnectivityManager::class.java)
+                        ?.getNetworkCapabilities(net)
+                    val transport = when {
+                        caps == null -> "?"
+                        caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
+                        caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
+                        else -> "OTHER"
+                    }
+                    LogStore.append("setUnderlyingNetworks transport=$transport")
                 } catch (e: Exception) {
                     LogStore.append("setUnderlyingNetworks: ${e.message}")
                 }
@@ -457,40 +465,68 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     }
 
     override fun getInterfaces(): NetworkInterfaceIterator {
+        // Defensive: only the active default uplink. Dual wlan0+rmnet0 + IPv6 link-local
+        // on Wi‑Fi previously fed libbox a bad set and correlated with silent death.
         return try {
             val cm = getSystemService(android.net.ConnectivityManager::class.java)
             val javaNifs = java.net.NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
             val list = mutableListOf<NetworkInterface>()
-            if (cm != null) {
-                for (network in cm.allNetworks) {
-                    val caps = cm.getNetworkCapabilities(network) ?: continue
+            val preferred = DefaultNetworkMonitor.underlying
+                ?: cm?.activeNetwork
+            val networks: List<android.net.Network> = when {
+                preferred != null -> listOf(preferred)
+                cm != null -> cm.allNetworks.toList()
+                else -> emptyList()
+            }
+            for (network in networks) {
+                try {
+                    val caps = cm?.getNetworkCapabilities(network) ?: continue
                     val lp = cm.getLinkProperties(network) ?: continue
                     if (!caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
-                    // Не отдаём сам VPN/tun — иначе auto_detect зациклится
                     if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) continue
                     val name = lp.interfaceName ?: continue
-                    if (name.startsWith("tun") || name.startsWith("ppp") || name.startsWith("wg")) continue
+                    if (name.startsWith("tun") || name.startsWith("ppp") ||
+                        name.startsWith("wg") || name.startsWith("dummy")
+                    ) {
+                        continue
+                    }
                     val javaNif = javaNifs.find { it.name == name } ?: continue
+                    if (!javaNif.isUp) continue
                     val box = NetworkInterface()
                     box.name = name
                     box.index = javaNif.index
-                    box.mtu = runCatching { javaNif.mtu }.getOrDefault(1500)
+                    box.mtu = runCatching { javaNif.mtu }.getOrDefault(1500).coerceIn(1280, 9000)
                     box.type = when {
-                        caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> Libbox.InterfaceTypeWIFI
-                        caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> Libbox.InterfaceTypeCellular
-                        caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) -> Libbox.InterfaceTypeEthernet
+                        caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) ->
+                            Libbox.InterfaceTypeWIFI
+                        caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) ->
+                            Libbox.InterfaceTypeCellular
+                        caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) ->
+                            Libbox.InterfaceTypeEthernet
                         else -> Libbox.InterfaceTypeOther
                     }
                     // IFF_UP | IFF_RUNNING
                     box.flags = 0x1 or 0x40
+                    // Prefer IPv4; skip IPv6 link-local (fe80::) — Wi‑Fi dual-stack crash vector.
                     val addrs = javaNif.interfaceAddresses.mapNotNull { ia ->
-                        val host = ia.address.hostAddress ?: return@mapNotNull null
+                        val addr = ia.address ?: return@mapNotNull null
+                        if (addr.isLoopbackAddress || addr.isLinkLocalAddress) return@mapNotNull null
+                        val host = addr.hostAddress ?: return@mapNotNull null
+                        if (host.contains('%')) return@mapNotNull null
                         "$host/${ia.networkPrefixLength}"
                     }
+                    if (addrs.isEmpty()) continue
                     box.addresses = StringArray(addrs)
-                    box.dnsServer = StringArray(lp.dnsServers.mapNotNull { it.hostAddress })
-                    box.metered = !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                    box.dnsServer = StringArray(
+                        lp.dnsServers.mapNotNull { it.hostAddress?.substringBefore('%') },
+                    )
+                    box.metered =
+                        !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
                     list.add(box)
+                    // Only one uplink — stop after preferred/active.
+                    if (preferred != null) break
+                } catch (e: Exception) {
+                    LogStore.append("getInterfaces skip network: ${e.message}")
                 }
             }
             LogStore.append("getInterfaces count=${list.size}: ${list.joinToString { it.name }}")
@@ -510,10 +546,10 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     }
 
     override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener?) {
-        LogStore.append("startDefaultInterfaceMonitor")
+        LogStore.append("startDefaultInterfaceMonitor (Go updateDefaultInterface disabled)")
         try {
             DefaultNetworkMonitor.start(this)
-            // Только сохранить listener — updateDefaultInterface после TUN (setUpdatesEnabled).
+            // Listener retained for API compat; monitor never calls updateDefaultInterface.
             DefaultNetworkMonitor.setListener(listener)
         } catch (e: Exception) {
             LogStore.append("startDefaultInterfaceMonitor ERROR: ${e.message}")

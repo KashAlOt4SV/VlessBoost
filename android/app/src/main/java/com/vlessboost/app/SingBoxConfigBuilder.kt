@@ -179,7 +179,9 @@ object SingBoxConfigBuilder {
             put(
                 "route",
                 JSONObject()
-                    .put("auto_detect_interface", true)
+                    // false: VpnService setUnderlyingNetworks + protect() выбирают uplink.
+                    // auto_detect + updateDefaultInterface(wlan0) на Wi‑Fi крашил процесс (1.1.7).
+                    .put("auto_detect_interface", false)
                     .put("default_domain_resolver", if (packages.isNotEmpty()) "dns-remote" else "dns-direct")
                     .put("rules", rules)
                     .put("final", if (packages.isNotEmpty()) "proxy" else "direct"),
