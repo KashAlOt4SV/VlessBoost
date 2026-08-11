@@ -195,20 +195,8 @@ def enable_text_clipboard(widget) -> None:
     ):
         target.bind(seq, handler)
 
-    # Russian layout: physical V/C/X/A → м/с/ч/ф
-    for seq, handler in (
-        ("<Control-м>", do_paste),
-        ("<Control-М>", do_paste),
-        ("<Control-с>", do_copy),
-        ("<Control-С>", do_copy),
-        ("<Control-ч>", do_cut),
-        ("<Control-Ч>", do_cut),
-        ("<Control-ф>", do_select_all),
-        ("<Control-Ф>", do_select_all),
-    ):
-        target.bind(seq, handler)
-
-    # Layout-independent fallback (covers odd keysyms Tk may emit under Ctrl)
+    # Layout-independent: Windows VK codes work regardless of keyboard layout
+    # (Russian Ctrl+м still reports keycode 86 for physical V, etc.)
     target.bind("<Control-KeyPress>", on_ctrl_key)
 
     menu = tk.Menu(target, tearoff=0)
