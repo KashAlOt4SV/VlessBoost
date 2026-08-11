@@ -12,6 +12,7 @@ from tkinter import messagebox
 from app.config_builder import collect_routes
 from app.icons import app_ico_path, load_logo, make_preset_icon
 from app.list_updater import update_all_remote
+from app.netcheck import ping_vless_url
 from app.presets import CATEGORY_LABELS, CATALOG, Preset
 from app.settings import Settings, load_settings, save_settings
 from app.singbox import SingBoxManager, is_admin, relaunch_as_admin
@@ -302,6 +303,7 @@ class BoosterApp(ctk.CTk):
         self._build()
         self._refresh_status()
         self.after(600, self._maybe_admin_prompt)
+        self.after(900, self._check_orphan_on_startup)
 
     def _apply_window_icons(self) -> None:
         import tkinter as tk
@@ -476,6 +478,29 @@ class BoosterApp(ctk.CTk):
             font=ctk.CTkFont(family="Segoe UI Black", size=16),
         )
         self.boost_btn.pack(side="right")
+
+        conn_bar = ctk.CTkFrame(page, fg_color=COLORS["panel"], corner_radius=14)
+        conn_bar.pack(fill="x", pady=(0, 10))
+        conn_inner = ctk.CTkFrame(conn_bar, fg_color="transparent")
+        conn_inner.pack(fill="x", padx=14, pady=10)
+        self.ping_lbl = ctk.CTkLabel(
+            conn_inner,
+            text="Пинг: —",
+            font=ctk.CTkFont(size=13),
+            text_color=COLORS["muted"],
+            anchor="w",
+        )
+        self.ping_lbl.pack(side="left")
+        ghost_btn(conn_inner, "Пинг сервера", self._ping_server, width=130, height=36).pack(
+            side="right", padx=(8, 0)
+        )
+        ghost_btn(
+            conn_inner,
+            "Проверить соединение",
+            self._check_active_connection,
+            width=180,
+            height=36,
+        ).pack(side="right")
 
         toolbar = ctk.CTkFrame(page, fg_color="transparent")
         toolbar.pack(fill="x", pady=(0, 10))
@@ -732,8 +757,22 @@ class BoosterApp(ctk.CTk):
             border_width=1,
             text_color=COLORS["text"],
         )
-        self.vless_box.pack(fill="x", pady=(0, 14))
+        self.vless_box.pack(fill="x", pady=(0, 8))
         self.vless_box.insert("1.0", self.settings.vless_url)
+
+        ping_row = ctk.CTkFrame(inner, fg_color="transparent")
+        ping_row.pack(fill="x", pady=(0, 14))
+        self.settings_ping_lbl = ctk.CTkLabel(
+            ping_row,
+            text="Пинг до сервера: —",
+            font=ctk.CTkFont(size=12),
+            text_color=COLORS["muted"],
+            anchor="w",
+        )
+        self.settings_ping_lbl.pack(side="left")
+        ghost_btn(ping_row, "Измерить пинг", self._ping_server, width=140, height=34).pack(
+            side="right"
+        )
 
         self.var_proc = ctk.BooleanVar(value=self.settings.route_processes)
         self.var_dom = ctk.BooleanVar(value=self.settings.route_domains)
@@ -811,9 +850,152 @@ class BoosterApp(ctk.CTk):
         ghost_btn(btns, "Проверить ссылку", self._validate_vless, width=150, height=42).pack(
             side="left"
         )
+        ghost_btn(
+            btns,
+            "Проверить соединение",
+            self._check_active_connection,
+            width=180,
+            height=42,
+        ).pack(side="left", padx=8)
         primary_btn(btns, "Сохранить", self._save_settings_ui, width=140, height=42).pack(
             side="right"
         )
+
+    def _vless_raw(self) -> str:
+        if hasattr(self, "vless_box"):
+            raw = self.vless_box.get("1.0", "end").strip()
+            if raw:
+                return raw
+        return (self.settings.vless_url or "").strip()
+
+    def _ping_server(self) -> None:
+        raw = self._vless_raw()
+        if not raw:
+            messagebox.showwarning(
+                "Нет ссылки",
+                "Сначала вставьте vless:// ссылку в настройках.",
+                parent=self,
+            )
+            return
+        self._set_ping_text("Пинг: измеряю…", COLORS["muted"])
+
+        def work() -> None:
+            try:
+                result = ping_vless_url(raw)
+                if result.ok and result.ms is not None:
+                    text = f"Пинг: ~{result.ms:.0f} мс  ({result.host}:{result.port})"
+                    color = COLORS["ok"] if result.ms < 200 else (
+                        COLORS["accent"] if result.ms < 400 else COLORS["danger"]
+                    )
+                else:
+                    text = f"Пинг: нет ответа ({result.error or 'ошибка'}) — {result.host}:{result.port}"
+                    color = COLORS["danger"]
+                self.after(0, lambda: self._set_ping_text(text, color))
+            except Exception as exc:
+                self.after(
+                    0,
+                    lambda: self._set_ping_text(f"Пинг: ошибка — {exc}", COLORS["danger"]),
+                )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_ping_text(self, text: str, color: str) -> None:
+        if hasattr(self, "ping_lbl"):
+            self.ping_lbl.configure(text=text, text_color=color)
+        if hasattr(self, "settings_ping_lbl"):
+            # Настройки: чуть другой префикс
+            pretty = text if text.startswith("Пинг") else text
+            if pretty.startswith("Пинг:"):
+                pretty = "Пинг до сервера:" + pretty[len("Пинг:") :]
+            self.settings_ping_lbl.configure(text=pretty, text_color=color)
+
+    def _check_orphan_on_startup(self) -> None:
+        try:
+            external = self.manager.external_instances()
+        except Exception:
+            return
+        if not external or self.manager.running:
+            return
+        pids = ", ".join(str(p) for p, _ in external)
+        self.status_lbl.configure(
+            text=f"⚠ Зависший sing-box (pid {pids})",
+            text_color=COLORS["accent"],
+        )
+        if messagebox.askyesno(
+            "Найдено активное соединение",
+            "Обнаружен работающий sing-box от прошлого запуска.\n"
+            f"PID: {pids}\n\n"
+            "Остановить его сейчас?",
+            parent=self,
+        ):
+            try:
+                killed = self.manager.kill_external()
+                messagebox.showinfo(
+                    "Готово",
+                    f"Остановлено процессов: {len(killed)}",
+                    parent=self,
+                )
+            except Exception as exc:
+                messagebox.showerror("Ошибка", str(exc), parent=self)
+            self._refresh_status()
+
+    def _check_active_connection(self) -> None:
+        def work() -> None:
+            try:
+                managed = self.manager.running
+                external = self.manager.external_instances()
+                self.after(0, lambda: self._show_connection_check(managed, external))
+            except Exception as exc:
+                self.after(
+                    0,
+                    lambda: messagebox.showerror("Проверка", str(exc), parent=self),
+                )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_connection_check(
+        self,
+        managed: bool,
+        external: list[tuple[int, str]],
+    ) -> None:
+        if managed and self.manager.managed_pid():
+            messagebox.showinfo(
+                "Соединение",
+                f"Ускорение активно в этом приложении.\n"
+                f"PID sing-box: {self.manager.managed_pid()}",
+                parent=self,
+            )
+            return
+        if external:
+            pids = ", ".join(str(p) for p, _ in external)
+            if messagebox.askyesno(
+                "Зависшее соединение",
+                "sing-box всё ещё работает, хотя приложение его не контролирует.\n"
+                f"PID: {pids}\n\n"
+                "Убить процесс и подключить заново?",
+                parent=self,
+            ):
+                try:
+                    self.manager.kill_external()
+                except Exception as exc:
+                    messagebox.showerror("Ошибка", str(exc), parent=self)
+                    return
+                self._refresh_status()
+                if messagebox.askyesno(
+                    "Подключить",
+                    "Старый процесс остановлен.\nВключить ускорение сейчас?",
+                    parent=self,
+                ):
+                    self._start()
+            else:
+                self._refresh_status()
+            return
+        messagebox.showinfo(
+            "Соединение",
+            "Активного sing-box не найдено. Можно включать ускорение.",
+            parent=self,
+        )
+        self._refresh_status()
 
     def _validate_vless(self) -> None:
         raw = self.vless_box.get("1.0", "end").strip()
@@ -1116,13 +1298,31 @@ class BoosterApp(ctk.CTk):
                 relaunch_as_admin()
             return
 
+        # Зависший sing-box с прошлого запуска
+        try:
+            external = self.manager.external_instances()
+        except Exception:
+            external = []
+        if external and not self.manager.running:
+            pids = ", ".join(str(p) for p, _ in external)
+            if not messagebox.askyesno(
+                "Активное соединение",
+                "Найден работающий sing-box от прошлого запуска.\n"
+                f"PID: {pids}\n\n"
+                "Убить его и подключиться заново?",
+                parent=self,
+            ):
+                return
+            # start() тоже убьёт, но сделаем явно до busy
+            self.manager.kill_external()
+
         self._busy = True
         self.boost_btn.configure(text="…", state="disabled")
 
         def work() -> None:
             try:
                 self.settings = load_settings()
-                self.manager.start(self.settings)
+                self.manager.start(self.settings, kill_external=True)
                 self.after(0, lambda: self._after_start(True, "Ускорение включено"))
             except Exception as exc:
                 logger.exception("start failed")
@@ -1140,6 +1340,8 @@ class BoosterApp(ctk.CTk):
                 msg + "\nЕсли программа уже была открыта — перезапустите её.",
                 parent=self,
             )
+            # Автопинг после успешного старта
+            self.after(200, self._ping_server)
         else:
             messagebox.showerror("Не удалось включить", msg, parent=self)
 
@@ -1158,6 +1360,18 @@ class BoosterApp(ctk.CTk):
                 fg_color=COLORS["danger"],
                 hover_color=COLORS["danger_hover"],
                 text_color="#FFFFFF",
+            )
+        elif self.manager.has_external_instance():
+            pids = ", ".join(str(p) for p, _ in self.manager.external_instances())
+            self.status_lbl.configure(
+                text=f"⚠ Зависший sing-box ({pids})",
+                text_color=COLORS["accent"],
+            )
+            self.boost_btn.configure(
+                text="Включить",
+                fg_color=COLORS["accent"],
+                hover_color=COLORS["accent_hover"],
+                text_color="#061018",
             )
         else:
             self.status_lbl.configure(text="○ Выключено", text_color=COLORS["muted"])

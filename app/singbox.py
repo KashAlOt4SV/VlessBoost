@@ -3,7 +3,6 @@ from __future__ import annotations
 import ctypes
 import json
 import logging
-import os
 import shutil
 import subprocess
 import sys
@@ -47,6 +46,91 @@ def relaunch_as_admin() -> None:
     )
 
 
+def _create_no_window() -> int:
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def list_singbox_processes() -> list[tuple[int, str]]:
+    """Все процессы sing-box.exe: (pid, executable_path)."""
+    ps = (
+        "Get-CimInstance Win32_Process -Filter \"Name = 'sing-box.exe'\" | "
+        "Select-Object ProcessId, ExecutablePath | ConvertTo-Json -Compress"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=_create_no_window(),
+        )
+    except Exception as exc:
+        logger.warning("list sing-box failed: %s", exc)
+        return []
+    text = (out.stdout or "").strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    result: list[tuple[int, str]] = []
+    for row in data:
+        try:
+            pid = int(row.get("ProcessId") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0:
+            continue
+        path = str(row.get("ExecutablePath") or "").strip()
+        result.append((pid, path))
+    return result
+
+
+def list_our_singbox_processes() -> list[tuple[int, str]]:
+    """sing-box из нашей папки bin/ (или без пути — считаем своим)."""
+    our = SINGBOX_EXE.resolve()
+    found: list[tuple[int, str]] = []
+    for pid, path in list_singbox_processes():
+        if not path:
+            found.append((pid, path))
+            continue
+        try:
+            p = Path(path).resolve()
+        except Exception:
+            found.append((pid, path))
+            continue
+        if p == our:
+            found.append((pid, path))
+            continue
+        # dist/bin рядом с exe и путь с именем проекта
+        low = str(p).lower()
+        if low.endswith("sing-box.exe") and ("vless" in low or "\\bin\\" in low or "/bin/" in low):
+            found.append((pid, path))
+    return found
+
+
+def kill_pids(pids: list[int]) -> list[int]:
+    """Убивает процессы, возвращает список успешно завершённых pid."""
+    killed: list[int] = []
+    for pid in pids:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=_create_no_window(),
+            )
+            killed.append(pid)
+        except Exception as exc:
+            logger.warning("taskkill %s failed: %s", pid, exc)
+    time.sleep(0.4)
+    return killed
+
+
 class SingBoxManager:
     def __init__(self) -> None:
         self._proc: subprocess.Popen[str] | None = None
@@ -56,6 +140,27 @@ class SingBoxManager:
     @property
     def running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    def managed_pid(self) -> int | None:
+        if self._proc is not None and self._proc.poll() is None:
+            return self._proc.pid
+        return None
+
+    def external_instances(self) -> list[tuple[int, str]]:
+        """Чужие/зависшие sing-box (не наш текущий Popen)."""
+        mine = self.managed_pid()
+        return [(pid, path) for pid, path in list_our_singbox_processes() if pid != mine]
+
+    def has_external_instance(self) -> bool:
+        return bool(self.external_instances())
+
+    def kill_external(self) -> list[int]:
+        pids = [pid for pid, _ in self.external_instances()]
+        if not pids:
+            return []
+        killed = kill_pids(pids)
+        logger.info("killed external sing-box: %s", killed)
+        return killed
 
     def ensure_binary(self) -> Path:
         if SINGBOX_EXE.exists():
@@ -79,9 +184,11 @@ class SingBoxManager:
                 raise RuntimeError("В архиве sing-box нет sing-box.exe")
             shutil.copy2(found, SINGBOX_EXE)
 
-    def start(self, settings: Settings) -> None:
+    def start(self, settings: Settings, *, kill_external: bool = True) -> None:
         if self.running:
             return
+        if kill_external and self.has_external_instance():
+            self.kill_external()
         if not is_admin():
             raise PermissionError(
                 "Для TUN-режима нужны права администратора. "
@@ -91,12 +198,11 @@ class SingBoxManager:
         self.ensure_binary()
         write_singbox_config(settings)
 
-        # Проверка конфига
         check = subprocess.run(
             [str(SINGBOX_EXE), "check", "-c", str(SINGBOX_CONFIG_PATH)],
             capture_output=True,
             text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=_create_no_window(),
         )
         if check.returncode != 0:
             raise RuntimeError(
@@ -113,7 +219,7 @@ class SingBoxManager:
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             cwd=str(BIN_DIR),
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=_create_no_window(),
         )
         time.sleep(0.8)
         if self._proc.poll() is not None:
@@ -124,20 +230,25 @@ class SingBoxManager:
         logger.info("sing-box запущен, pid=%s", self._proc.pid)
 
     def stop(self) -> None:
-        if not self._proc:
-            return
-        proc = self._proc
-        self._proc = None
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=3)
-        logger.info("sing-box остановлен")
+        if self._proc:
+            proc = self._proc
+            self._proc = None
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=3)
+            logger.info("sing-box остановлен")
+        if self.has_external_instance():
+            self.kill_external()
 
     def status_text(self) -> str:
         if self.running and self._proc:
             return f"Работает (pid {self._proc.pid})"
+        external = self.external_instances()
+        if external:
+            pids = ", ".join(str(p) for p, _ in external)
+            return f"Найден зависший sing-box (pid {pids})"
         return "Остановлен"
