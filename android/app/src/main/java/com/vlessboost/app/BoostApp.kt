@@ -11,6 +11,7 @@ class BoostApp : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        LogStore.init(filesDir)
         val prev = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             runCatching {
@@ -37,6 +38,7 @@ class BoostApp : Application() {
             )
             Libbox.setLocale("ru")
             Log.i(TAG, "libbox ${Libbox.version()}")
+            LogStore.append("libbox ${Libbox.version()} ready")
         } catch (e: Throwable) {
             // Never take down the whole process on UI launch if native init fails.
             Log.e(TAG, "libbox setup failed", e)

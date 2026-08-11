@@ -19,8 +19,10 @@ import java.util.concurrent.atomic.AtomicInteger
  * Следит за реальной сетью (Wi‑Fi/LTE), исключая VPN —
  * без этого sing-box пишет "no available network interface".
  *
- * Важно: updateDefaultInterface вызывается с одной очереди и с generation-check,
- * иначе параллельные вызовы / use-after-free Go-объекта роняют процесс без FATAL в LogStore.
+ * Важно:
+ * - updateDefaultInterface вызывается с одной очереди и с generation-check
+ * - до [setUpdatesEnabled](true) callback'и только запоминают сеть, но НЕ зовут Go
+ *   (иначе гонка с openTun → silent native death без FATAL в LogStore).
  */
 object DefaultNetworkMonitor {
     private const val TAG = "DefaultNetMon"
@@ -31,6 +33,10 @@ object DefaultNetworkMonitor {
 
     @Volatile
     private var listener: InterfaceUpdateListener? = null
+
+    @Volatile
+    private var updatesEnabled = false
+
     private var registered = false
     private var cm: ConnectivityManager? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -54,7 +60,6 @@ object DefaultNetworkMonitor {
         override fun onLost(network: Network) {
             if (network == underlying) {
                 underlying = null
-                // попробуем другую сеть, иначе очистим
                 val connectivity = cm
                 if (connectivity != null) {
                     pickInitial(connectivity)
@@ -68,6 +73,7 @@ object DefaultNetworkMonitor {
 
     fun start(context: Context) {
         if (registered) return
+        updatesEnabled = false
         cm = context.applicationContext.getSystemService(ConnectivityManager::class.java)
         val connectivity = cm ?: return
         val request = NetworkRequest.Builder()
@@ -100,6 +106,7 @@ object DefaultNetworkMonitor {
 
     fun stop() {
         resolveGeneration.incrementAndGet()
+        updatesEnabled = false
         val connectivity = cm
         if (registered && connectivity != null) {
             runCatching { connectivity.unregisterNetworkCallback(callback) }
@@ -110,9 +117,24 @@ object DefaultNetworkMonitor {
         cm = null
     }
 
+    /** Включать только после того, как startOrReloadService / openTun уже завершились. */
+    fun setUpdatesEnabled(enabled: Boolean) {
+        updatesEnabled = enabled
+        LogStore.append("network monitor updatesEnabled=$enabled")
+        if (enabled) {
+            notifyListener(underlying)
+        } else {
+            resolveGeneration.incrementAndGet()
+        }
+    }
+
     fun setListener(updateListener: InterfaceUpdateListener?) {
         listener = updateListener
-        notifyListener(underlying)
+        LogStore.append("network monitor listener=${if (updateListener != null) "set" else "cleared"}")
+        // Не пушим в Go сразу — ждём setUpdatesEnabled(true) после TUN.
+        if (updatesEnabled) {
+            notifyListener(underlying)
+        }
     }
 
     private fun isVpnNetwork(network: Network): Boolean {
@@ -140,6 +162,7 @@ object DefaultNetworkMonitor {
     }
 
     private fun notifyListener(network: Network?) {
+        if (!updatesEnabled) return
         val updateListener = listener ?: return
         val connectivity = cm ?: return
         val gen = resolveGeneration.incrementAndGet()

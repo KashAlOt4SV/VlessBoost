@@ -130,11 +130,12 @@ object SingBoxConfigBuilder {
             put("tag", "tun-in")
             put("address", JSONArray().put("172.19.0.1/30"))
             put("mtu", 1500)
-            put("auto_route", true)
+            // На Android VpnService маршруты/DNS задаёт Builder (openTun), а не netlink.
+            // auto_route:true провоцирует лишнюю логику в libbox и silent crash сразу после TUN up.
+            put("auto_route", false)
             put("strict_route", false)
-            // system stack на Android VpnService часто даёт silent native crash после TUN up;
-            // mixed/gvisor — как в SFA и Windows-сборке.
-            put("stack", "mixed")
+            // gvisor стабильнее mixed/system на VpnService после TUN establish.
+            put("stack", "gvisor")
             put("endpoint_independent_nat", true)
             if (packages.isNotEmpty()) {
                 put("include_package", JSONArray(packages.toList()))

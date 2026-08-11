@@ -1,12 +1,12 @@
 {
   "android": {
-    "versionCode": 6,
-    "versionName": "1.1.6",
-    "url": "https://github.com/KashAlOt4SV/VlessBoost/releases/download/v1.1.6/VLESS-Boost.apk"
+    "versionCode": 7,
+    "versionName": "1.1.7",
+    "url": "https://github.com/KashAlOt4SV/VlessBoost/releases/download/v1.1.7/VLESS-Boost.apk"
   },
   "windows": {
     "version": "1.1.5",
     "url": "https://github.com/KashAlOt4SV/VlessBoost/releases/download/v1.1.5/VLESS-Boost-windows.zip"
   },
-  "updated": "2026-08-11T22:16:24Z"
+  "updated": "2026-08-11T22:30:00Z"
 }

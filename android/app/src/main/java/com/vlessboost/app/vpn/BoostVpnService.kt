@@ -111,6 +111,7 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         Seq.touch()
         Libbox.touch()
 
+        DefaultNetworkMonitor.setUpdatesEnabled(false)
         DefaultNetworkMonitor.start(this@BoostVpnService)
 
         stopLogClient()
@@ -127,11 +128,16 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         val override = OverrideOptions().apply {
             autoRedirect = false
         }
+        LogStore.append("calling startOrReloadService…")
         server.startOrReloadService(config, override)
-        LogStore.append("service started / reloaded")
+        LogStore.append("service started / reloaded (after openTun)")
         isRunning = true
+        // Только теперь пушим default iface в Go — иначе гонка с openTun убивает процесс.
+        DefaultNetworkMonitor.setUpdatesEnabled(true)
+        LogStore.append("post-start: monitor updates armed")
         delay(300)
         startLogClient()
+        LogStore.append("post-start: log client done, still alive")
     }
 
     private fun startLogClient() {
@@ -285,12 +291,16 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                 builder.addAddress(address.address(), address.prefix())
             }
 
+            // VpnService сам добавляет маршруты/DNS. При auto_route=false libbox не
+            // отдаёт route list — ставим полный IPv4 default + DNS для hijack.
+            var dnsAdded = 0
             if (options.autoRoute) {
                 val dnsMode = options.getDNSMode()?.value
                 if (dnsMode != null && dnsMode != Libbox.DNSModeDisabled) {
                     val dnsServerAddress = options.getDNSServerAddress()
                     while (dnsServerAddress.hasNext()) {
                         builder.addDnsServer(dnsServerAddress.next())
+                        dnsAdded++
                     }
                 }
 
@@ -331,7 +341,10 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                 }
             } else {
                 builder.addRoute("0.0.0.0", 0)
+                builder.addDnsServer("1.1.1.1")
+                dnsAdded = 1
             }
+            LogStore.append("openTun routes autoRoute=${options.autoRoute} dns=$dnsAdded")
 
             val allowed = linkedSetOf<String>()
             val includePackage = options.includePackage
@@ -378,6 +391,7 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             }
             if (allowed.isEmpty()) error("Не выбрано ни одного приложения")
 
+            LogStore.append("openTun establish… packages=${allowed.size}")
             val pfd = builder.establish() ?: error("Не удалось создать VPN-интерфейс")
             tunPfd = pfd
             LogStore.append("TUN established fd=${pfd.fd} packages=${allowed.size}")
@@ -391,7 +405,9 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
     override fun autoDetectInterfaceControl(fd: Int) {
         try {
-            protect(fd)
+            if (!protect(fd)) {
+                LogStore.append("protect($fd)=false")
+            }
         } catch (e: Exception) {
             LogStore.append("protect($fd) error: ${e.message}")
             Log.w(TAG, "protect $fd", e)
@@ -497,6 +513,7 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         LogStore.append("startDefaultInterfaceMonitor")
         try {
             DefaultNetworkMonitor.start(this)
+            // Только сохранить listener — updateDefaultInterface после TUN (setUpdatesEnabled).
             DefaultNetworkMonitor.setListener(listener)
         } catch (e: Exception) {
             LogStore.append("startDefaultInterfaceMonitor ERROR: ${e.message}")
@@ -506,6 +523,7 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
     override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener?) {
         try {
+            DefaultNetworkMonitor.setUpdatesEnabled(false)
             DefaultNetworkMonitor.setListener(null)
         } catch (e: Exception) {
             LogStore.append("closeDefaultInterfaceMonitor ERROR: ${e.message}")

@@ -27,11 +27,18 @@ class LogsActivity : AppCompatActivity() {
         binding = ActivityLogsBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        binding.logsText.text = LogStore.snapshot()
+        val mem = LogStore.snapshot()
+        binding.logsText.text = if (mem.isNotBlank()) {
+            mem
+        } else {
+            val disk = LogStore.readPersisted()
+            if (disk.isNotBlank()) "—— last session (disk) ——\n$disk" else ""
+        }
         binding.btnClearLogs.setOnClickListener { LogStore.clear() }
         binding.btnCopyLogs.setOnClickListener {
             val cm = getSystemService(ClipboardManager::class.java)
-            cm.setPrimaryClip(ClipData.newPlainText("logs", LogStore.snapshot()))
+            val text = LogStore.snapshot().ifBlank { LogStore.readPersisted() }
+            cm.setPrimaryClip(ClipData.newPlainText("logs", text))
             Toast.makeText(this, "Логи скопированы", Toast.LENGTH_SHORT).show()
         }
     }
