@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Windows app runtime / build
+bin/
+config/settings.json
+config/sing-box.json
+config/app.log
+config/cache/
+presets/user_overrides.json
+build/
+dist/
+*.spec.bak
+
+# Android
+android/.gradle/
+android/local.properties
+android/**/build/
+android/**/.cxx/
+android/app/libs/*.aar
+android/app/libs/*.jar
+android/*.apk
+android/**/*.apk
+*.apk
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db

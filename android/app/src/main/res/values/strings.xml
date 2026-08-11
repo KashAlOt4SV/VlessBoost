@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VLESS Boost</string>
+    <string name="boost_on">Включить</string>
+    <string name="boost_off">Выключить</string>
+    <string name="status_off">Выключено</string>
+    <string name="status_on">Включено</string>
+    <string name="status_starting">Запуск…</string>
+    <string name="vpn_permission">Нужно разрешение VPN</string>
+    <string name="need_link">Сначала вставьте ссылку VPN</string>
+    <string name="select_apps">Выберите приложения</string>
+</resources>
