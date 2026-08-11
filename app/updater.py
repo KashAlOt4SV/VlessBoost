@@ -15,7 +15,7 @@ from app import __version__
 
 logger = logging.getLogger(__name__)
 
-MANIFEST_URL = "https://raw.githubusercontent.com/KashAlOt4SV/VlessBoost/main/update/version.json"
+MANIFEST_URL = "https://cdn.jsdelivr.net/gh/KashAlOt4SV/VlessBoost@main/update/version.json"
 
 
 @dataclass

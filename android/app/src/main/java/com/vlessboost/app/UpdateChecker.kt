@@ -10,7 +10,7 @@ import java.net.URL
  */
 object UpdateChecker {
     const val MANIFEST_URL =
-        "https://raw.githubusercontent.com/KashAlOt4SV/VlessBoost/main/update/version.json"
+        "https://cdn.jsdelivr.net/gh/KashAlOt4SV/VlessBoost@main/update/version.json"
 
     data class AndroidUpdate(
         val versionCode: Int,
