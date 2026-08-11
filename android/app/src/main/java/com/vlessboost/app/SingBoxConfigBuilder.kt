@@ -132,8 +132,9 @@ object SingBoxConfigBuilder {
             put("mtu", 1500)
             put("auto_route", true)
             put("strict_route", false)
-            // system stack стабильнее на Android VpnService
-            put("stack", "system")
+            // system stack на Android VpnService часто даёт silent native crash после TUN up;
+            // mixed/gvisor — как в SFA и Windows-сборке.
+            put("stack", "mixed")
             put("endpoint_independent_nat", true)
             if (packages.isNotEmpty()) {
                 put("include_package", JSONArray(packages.toList()))

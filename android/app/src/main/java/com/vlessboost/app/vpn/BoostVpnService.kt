@@ -122,9 +122,10 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         commandServer = server
         LogStore.append("command server started")
 
+        // include_package уже в JSON-конфиге — не дублируем через OverrideOptions
+        // (иначе TunOptions отдаёт пакеты дважды: packages=2N).
         val override = OverrideOptions().apply {
             autoRedirect = false
-            includePackage = StringArray(packages.iterator())
         }
         server.startOrReloadService(config, override)
         LogStore.append("service started / reloaded")
@@ -252,127 +253,149 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
     // region PlatformInterface
     override fun openTun(options: TunOptions): Int {
-        if (prepare(this) != null) error("Нет разрешения VPN")
+        try {
+            if (prepare(this) != null) error("Нет разрешения VPN")
 
-        val builder = Builder()
-            .setSession("VLESS Boost")
-            .setMtu(options.getMTU())
+            val builder = Builder()
+                .setSession("VLESS Boost")
+                .setMtu(options.getMTU())
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            builder.setMetered(false)
-        }
-
-        // Физическая сеть под VPN — иначе outbound не знает куда биндиться
-        DefaultNetworkMonitor.underlying?.let { net ->
-            try {
-                builder.setUnderlyingNetworks(arrayOf(net))
-                LogStore.append("underlying network set")
-            } catch (e: Exception) {
-                LogStore.append("setUnderlyingNetworks: ${e.message}")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                builder.setMetered(false)
             }
-        }
 
-        val inet4Address = options.inet4Address
-        while (inet4Address.hasNext()) {
-            val address = inet4Address.next()
-            builder.addAddress(address.address(), address.prefix())
-        }
-        val inet6Address = options.inet6Address
-        while (inet6Address.hasNext()) {
-            val address = inet6Address.next()
-            builder.addAddress(address.address(), address.prefix())
-        }
-
-        if (options.autoRoute) {
-            val dnsMode = options.getDNSMode()?.value
-            if (dnsMode != null && dnsMode != Libbox.DNSModeDisabled) {
-                val dnsServerAddress = options.getDNSServerAddress()
-                while (dnsServerAddress.hasNext()) {
-                    builder.addDnsServer(dnsServerAddress.next())
+            // Физическая сеть под VPN — иначе outbound не знает куда биндиться
+            DefaultNetworkMonitor.underlying?.let { net ->
+                try {
+                    builder.setUnderlyingNetworks(arrayOf(net))
+                    LogStore.append("underlying network set")
+                } catch (e: Exception) {
+                    LogStore.append("setUnderlyingNetworks: ${e.message}")
                 }
             }
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                val inet4RouteAddress = options.inet4RouteAddress
-                if (inet4RouteAddress.hasNext()) {
-                    while (inet4RouteAddress.hasNext()) {
-                        val a = inet4RouteAddress.next()
-                        builder.addRoute(a.address(), a.prefix())
+            val inet4Address = options.inet4Address
+            while (inet4Address.hasNext()) {
+                val address = inet4Address.next()
+                builder.addAddress(address.address(), address.prefix())
+            }
+            val inet6Address = options.inet6Address
+            while (inet6Address.hasNext()) {
+                val address = inet6Address.next()
+                builder.addAddress(address.address(), address.prefix())
+            }
+
+            if (options.autoRoute) {
+                val dnsMode = options.getDNSMode()?.value
+                if (dnsMode != null && dnsMode != Libbox.DNSModeDisabled) {
+                    val dnsServerAddress = options.getDNSServerAddress()
+                    while (dnsServerAddress.hasNext()) {
+                        builder.addDnsServer(dnsServerAddress.next())
+                    }
+                }
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    val inet4RouteAddress = options.inet4RouteAddress
+                    if (inet4RouteAddress.hasNext()) {
+                        while (inet4RouteAddress.hasNext()) {
+                            val a = inet4RouteAddress.next()
+                            builder.addRoute(a.address(), a.prefix())
+                        }
+                    } else {
+                        builder.addRoute("0.0.0.0", 0)
+                    }
+                    val inet6RouteAddress = options.inet6RouteAddress
+                    if (inet6RouteAddress.hasNext()) {
+                        while (inet6RouteAddress.hasNext()) {
+                            val a = inet6RouteAddress.next()
+                            builder.addRoute(a.address(), a.prefix())
+                        }
                     }
                 } else {
-                    builder.addRoute("0.0.0.0", 0)
-                }
-                val inet6RouteAddress = options.inet6RouteAddress
-                if (inet6RouteAddress.hasNext()) {
-                    while (inet6RouteAddress.hasNext()) {
-                        val a = inet6RouteAddress.next()
-                        builder.addRoute(a.address(), a.prefix())
+                    val inet4RouteAddress = options.inet4RouteRange
+                    if (inet4RouteAddress.hasNext()) {
+                        while (inet4RouteAddress.hasNext()) {
+                            val a = inet4RouteAddress.next()
+                            builder.addRoute(a.address(), a.prefix())
+                        }
+                    } else {
+                        builder.addRoute("0.0.0.0", 0)
+                    }
+                    val inet6RouteAddress = options.inet6RouteRange
+                    if (inet6RouteAddress.hasNext()) {
+                        while (inet6RouteAddress.hasNext()) {
+                            val a = inet6RouteAddress.next()
+                            builder.addRoute(a.address(), a.prefix())
+                        }
                     }
                 }
             } else {
-                val inet4RouteAddress = options.inet4RouteRange
-                if (inet4RouteAddress.hasNext()) {
-                    while (inet4RouteAddress.hasNext()) {
-                        val a = inet4RouteAddress.next()
-                        builder.addRoute(a.address(), a.prefix())
-                    }
-                } else {
-                    builder.addRoute("0.0.0.0", 0)
-                }
-                val inet6RouteAddress = options.inet6RouteRange
-                if (inet6RouteAddress.hasNext()) {
-                    while (inet6RouteAddress.hasNext()) {
-                        val a = inet6RouteAddress.next()
-                        builder.addRoute(a.address(), a.prefix())
-                    }
-                }
+                builder.addRoute("0.0.0.0", 0)
             }
-        } else {
-            builder.addRoute("0.0.0.0", 0)
-        }
 
-        val includePackage = options.includePackage
-        var included = 0
-        while (includePackage.hasNext()) {
-            val pkg = includePackage.next()
-            try {
-                builder.addAllowedApplication(pkg)
-                included++
-                Log.d(TAG, "allow $pkg")
-            } catch (e: NameNotFoundException) {
-                Log.w(TAG, "missing package $pkg")
-            }
-        }
-
-        val excludePackage = options.excludePackage
-        while (excludePackage.hasNext()) {
-            val pkg = excludePackage.next()
-            try {
-                builder.addDisallowedApplication(pkg)
-            } catch (_: NameNotFoundException) {
-            }
-        }
-
-        if (included == 0) {
-            // Fallback: если в TunOptions пусто — берём из Prefs
-            Prefs(this).selectedApps.forEach { pkg ->
+            val allowed = linkedSetOf<String>()
+            val includePackage = options.includePackage
+            while (includePackage.hasNext()) {
+                val pkg = includePackage.next()
+                if (pkg.isNullOrBlank() || !allowed.add(pkg)) continue
                 try {
                     builder.addAllowedApplication(pkg)
-                    included++
-                } catch (_: NameNotFoundException) {
+                    Log.d(TAG, "allow $pkg")
+                } catch (e: NameNotFoundException) {
+                    allowed.remove(pkg)
+                    Log.w(TAG, "missing package $pkg")
+                    LogStore.append("openTun: missing package $pkg")
+                } catch (e: Exception) {
+                    allowed.remove(pkg)
+                    LogStore.append("openTun: allow $pkg failed: ${e.message}")
                 }
             }
-        }
-        if (included == 0) error("Не выбрано ни одного приложения")
 
-        val pfd = builder.establish() ?: error("Не удалось создать VPN-интерфейс")
-        tunPfd = pfd
-        LogStore.append("TUN established fd=${pfd.fd} packages=$included")
-        return pfd.fd
+            val excludePackage = options.excludePackage
+            while (excludePackage.hasNext()) {
+                val pkg = excludePackage.next()
+                try {
+                    builder.addDisallowedApplication(pkg)
+                } catch (_: NameNotFoundException) {
+                } catch (e: Exception) {
+                    LogStore.append("openTun: disallow $pkg failed: ${e.message}")
+                }
+            }
+
+            if (allowed.isEmpty()) {
+                // Fallback: если в TunOptions пусто — берём из Prefs
+                Prefs(this).selectedApps.forEach { pkg ->
+                    if (!allowed.add(pkg)) return@forEach
+                    try {
+                        builder.addAllowedApplication(pkg)
+                    } catch (_: NameNotFoundException) {
+                        allowed.remove(pkg)
+                    } catch (e: Exception) {
+                        allowed.remove(pkg)
+                        LogStore.append("openTun: fallback allow $pkg failed: ${e.message}")
+                    }
+                }
+            }
+            if (allowed.isEmpty()) error("Не выбрано ни одного приложения")
+
+            val pfd = builder.establish() ?: error("Не удалось создать VPN-интерфейс")
+            tunPfd = pfd
+            LogStore.append("TUN established fd=${pfd.fd} packages=${allowed.size}")
+            return pfd.fd
+        } catch (e: Exception) {
+            LogStore.append("openTun ERROR: ${e.message}")
+            Log.e(TAG, "openTun", e)
+            throw e
+        }
     }
 
     override fun autoDetectInterfaceControl(fd: Int) {
-        protect(fd)
+        try {
+            protect(fd)
+        } catch (e: Exception) {
+            LogStore.append("protect($fd) error: ${e.message}")
+            Log.w(TAG, "protect $fd", e)
+        }
     }
 
     override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
@@ -387,78 +410,106 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         destinationAddress: String?,
         destinationPort: Int,
     ): ConnectionOwner {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            throw UnsupportedOperationException("findConnectionOwner needs API 29+")
-        }
-        val cm = getSystemService(android.net.ConnectivityManager::class.java)
-        val uid = cm.getConnectionOwnerUid(
-            ipProtocol,
-            java.net.InetSocketAddress(sourceAddress, sourcePort),
-            java.net.InetSocketAddress(destinationAddress, destinationPort),
-        )
-        if (uid == android.os.Process.INVALID_UID) {
-            throw IllegalStateException("connection owner not found")
-        }
-        val packages = packageManager.getPackagesForUid(uid)
-        return ConnectionOwner().apply {
-            userId = uid
-            userName = packages?.firstOrNull().orEmpty()
-            setAndroidPackageNames(StringArray(packages?.toList()?.iterator() ?: emptyList<String>().iterator()))
+        // Непроброшенные Java-исключения через JNI/gomobile часто убивают процесс без LogStore.
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                error("android: findConnectionOwner requires API 29+")
+            }
+            val cm = getSystemService(android.net.ConnectivityManager::class.java)
+                ?: error("android: ConnectivityManager missing")
+            val uid = cm.getConnectionOwnerUid(
+                ipProtocol,
+                java.net.InetSocketAddress(sourceAddress ?: "", sourcePort),
+                java.net.InetSocketAddress(destinationAddress ?: "", destinationPort),
+            )
+            if (uid == android.os.Process.INVALID_UID) {
+                error("android: connection owner not found")
+            }
+            val packages = packageManager.getPackagesForUid(uid)?.toList().orEmpty()
+            return ConnectionOwner().apply {
+                userId = uid
+                userName = packages.firstOrNull().orEmpty()
+                setAndroidPackageNames(StringArray(packages))
+            }
+        } catch (e: Exception) {
+            LogStore.append(
+                "findConnectionOwner fail proto=$ipProtocol " +
+                    "${sourceAddress ?: "?"}:$sourcePort -> ${destinationAddress ?: "?"}:$destinationPort: ${e.message}",
+            )
+            throw e
         }
     }
 
     override fun getInterfaces(): NetworkInterfaceIterator {
-        val cm = getSystemService(android.net.ConnectivityManager::class.java)
-        val javaNifs = java.net.NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
-        val list = mutableListOf<NetworkInterface>()
-        for (network in cm.allNetworks) {
-            val caps = cm.getNetworkCapabilities(network) ?: continue
-            val lp = cm.getLinkProperties(network) ?: continue
-            if (!caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
-            // Не отдаём сам VPN/tun — иначе auto_detect зациклится
-            if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) continue
-            val name = lp.interfaceName ?: continue
-            if (name.startsWith("tun") || name.startsWith("ppp") || name.startsWith("wg")) continue
-            val javaNif = javaNifs.find { it.name == name } ?: continue
-            val box = NetworkInterface()
-            box.name = name
-            box.index = javaNif.index
-            box.mtu = runCatching { javaNif.mtu }.getOrDefault(1500)
-            box.type = when {
-                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> Libbox.InterfaceTypeWIFI
-                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> Libbox.InterfaceTypeCellular
-                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) -> Libbox.InterfaceTypeEthernet
-                else -> Libbox.InterfaceTypeOther
+        return try {
+            val cm = getSystemService(android.net.ConnectivityManager::class.java)
+            val javaNifs = java.net.NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+            val list = mutableListOf<NetworkInterface>()
+            if (cm != null) {
+                for (network in cm.allNetworks) {
+                    val caps = cm.getNetworkCapabilities(network) ?: continue
+                    val lp = cm.getLinkProperties(network) ?: continue
+                    if (!caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+                    // Не отдаём сам VPN/tun — иначе auto_detect зациклится
+                    if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) continue
+                    val name = lp.interfaceName ?: continue
+                    if (name.startsWith("tun") || name.startsWith("ppp") || name.startsWith("wg")) continue
+                    val javaNif = javaNifs.find { it.name == name } ?: continue
+                    val box = NetworkInterface()
+                    box.name = name
+                    box.index = javaNif.index
+                    box.mtu = runCatching { javaNif.mtu }.getOrDefault(1500)
+                    box.type = when {
+                        caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> Libbox.InterfaceTypeWIFI
+                        caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> Libbox.InterfaceTypeCellular
+                        caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) -> Libbox.InterfaceTypeEthernet
+                        else -> Libbox.InterfaceTypeOther
+                    }
+                    // IFF_UP | IFF_RUNNING
+                    box.flags = 0x1 or 0x40
+                    val addrs = javaNif.interfaceAddresses.mapNotNull { ia ->
+                        val host = ia.address.hostAddress ?: return@mapNotNull null
+                        "$host/${ia.networkPrefixLength}"
+                    }
+                    box.addresses = StringArray(addrs)
+                    box.dnsServer = StringArray(lp.dnsServers.mapNotNull { it.hostAddress })
+                    box.metered = !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                    list.add(box)
+                }
             }
-            // IFF_UP | IFF_RUNNING
-            box.flags = 0x1 or 0x40
-            box.addresses = StringArray(
-                javaNif.interfaceAddresses.mapNotNull { ia ->
-                    val host = ia.address.hostAddress ?: return@mapNotNull null
-                    // skip IPv6 link-local noise if needed — keep all
-                    "$host/${ia.networkPrefixLength}"
-                }.iterator(),
-            )
-            box.dnsServer = StringArray(lp.dnsServers.mapNotNull { it.hostAddress }.iterator())
-            box.metered = !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
-            list.add(box)
-        }
-        LogStore.append("getInterfaces count=${list.size}: ${list.joinToString { it.name }}")
-        return object : NetworkInterfaceIterator {
-            private val it = list.iterator()
-            override fun hasNext(): Boolean = it.hasNext()
-            override fun next(): NetworkInterface = it.next()
+            LogStore.append("getInterfaces count=${list.size}: ${list.joinToString { it.name }}")
+            object : NetworkInterfaceIterator {
+                private val it = list.iterator()
+                override fun hasNext(): Boolean = it.hasNext()
+                override fun next(): NetworkInterface = it.next()
+            }
+        } catch (e: Exception) {
+            LogStore.append("getInterfaces ERROR: ${e.message}")
+            Log.e(TAG, "getInterfaces", e)
+            object : NetworkInterfaceIterator {
+                override fun hasNext(): Boolean = false
+                override fun next(): NetworkInterface = NetworkInterface()
+            }
         }
     }
 
     override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener?) {
         LogStore.append("startDefaultInterfaceMonitor")
-        DefaultNetworkMonitor.start(this)
-        DefaultNetworkMonitor.setListener(listener)
+        try {
+            DefaultNetworkMonitor.start(this)
+            DefaultNetworkMonitor.setListener(listener)
+        } catch (e: Exception) {
+            LogStore.append("startDefaultInterfaceMonitor ERROR: ${e.message}")
+            Log.e(TAG, "startDefaultInterfaceMonitor", e)
+        }
     }
 
     override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener?) {
-        DefaultNetworkMonitor.setListener(null)
+        try {
+            DefaultNetworkMonitor.setListener(null)
+        } catch (e: Exception) {
+            LogStore.append("closeDefaultInterfaceMonitor ERROR: ${e.message}")
+        }
     }
     override fun startNeighborMonitor(listener: NeighborUpdateListener?) {}
     override fun closeNeighborMonitor(listener: NeighborUpdateListener?) {}
@@ -535,10 +586,15 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         )
     }
 
-    class StringArray(private val iterator: Iterator<String>) : StringIterator {
-        override fun len(): Int = 0
-        override fun hasNext(): Boolean = iterator.hasNext()
-        override fun next(): String = iterator.next()
+    class StringArray(values: Collection<String>) : StringIterator {
+        constructor(iterator: Iterator<String>) : this(iterator.asSequence().toList())
+
+        private val items = values.toList()
+        private var index = 0
+
+        override fun len(): Int = items.size
+        override fun hasNext(): Boolean = index < items.size
+        override fun next(): String = items[index++]
     }
 
     companion object {

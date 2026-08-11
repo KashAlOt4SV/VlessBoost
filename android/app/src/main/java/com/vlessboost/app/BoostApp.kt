@@ -11,6 +11,15 @@ class BoostApp : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            runCatching {
+                LogStore.append("FATAL thread=${t.name}: ${e.javaClass.simpleName}: ${e.message}")
+                e.stackTrace.take(12).forEach { LogStore.append("  at $it") }
+            }
+            Log.e(TAG, "uncaught on ${t.name}", e)
+            prev?.uncaughtException(t, e)
+        }
         // Required for gomobile/libbox on Android 10+ (no AppGlobals reflection).
         Seq.setContext(this)
         val base = filesDir
@@ -31,6 +40,7 @@ class BoostApp : Application() {
         } catch (e: Throwable) {
             // Never take down the whole process on UI launch if native init fails.
             Log.e(TAG, "libbox setup failed", e)
+            runCatching { LogStore.append("libbox setup failed: ${e.message}") }
         }
     }
 
