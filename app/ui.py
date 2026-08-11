@@ -1105,7 +1105,8 @@ class BoosterApp(ctk.CTk):
                 msg = "\n".join(lines) or "Нечего обновлять"
                 self.after(0, lambda: self._lists_done(msg))
             except Exception as exc:
-                self.after(0, lambda: self._lists_done(f"Ошибка: {exc}"))
+                err = str(exc) or repr(exc)
+                self.after(0, lambda m=err: self._lists_done(f"Ошибка: {m}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1257,7 +1258,8 @@ class BoosterApp(ctk.CTk):
 
                 self.after(0, ask)
             except Exception as exc:
-                self.after(0, lambda: self._update_done(f"Ошибка: {exc}"))
+                err = str(exc) or repr(exc)
+                self.after(0, lambda m=err: self._update_done(f"Ошибка: {m}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1326,7 +1328,8 @@ class BoosterApp(ctk.CTk):
                 self.after(0, lambda: self._after_start(True, "Ускорение включено"))
             except Exception as exc:
                 logger.exception("start failed")
-                self.after(0, lambda: self._after_start(False, str(exc)))
+                err = str(exc) or repr(exc)
+                self.after(0, lambda m=err: self._after_start(False, m))
 
         threading.Thread(target=work, daemon=True).start()
 
