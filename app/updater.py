@@ -6,6 +6,7 @@ import json
 import logging
 import tempfile
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,7 +14,6 @@ from app import __version__
 
 logger = logging.getLogger(__name__)
 
-# Замените на свой raw URL (GitHub Releases / raw / CDN)
 MANIFEST_URL = "https://raw.githubusercontent.com/KashAlOt4SV/VlessBoost/main/update/version.json"
 
 
@@ -53,7 +53,8 @@ def check_windows_update(current: str | None = None) -> WindowsUpdate | None:
 
 def download_file(url: str, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url, timeout=120) as resp, open(dest, "wb") as out:
+    req = urllib.request.Request(url, headers={"User-Agent": "VLESS-Boost-Updater"})
+    with urllib.request.urlopen(req, timeout=180) as resp, open(dest, "wb") as out:
         while True:
             chunk = resp.read(1024 * 256)
             if not chunk:
@@ -63,5 +64,26 @@ def download_file(url: str, dest: Path) -> Path:
 
 
 def download_update_to_temp(url: str, version: str) -> Path:
-    path = Path(tempfile.gettempdir()) / f"VLESS-Boost-{version}.exe"
-    return download_file(url, path)
+    """Скачивает .exe или .zip (с exe внутри) во временную папку."""
+    tmp = Path(tempfile.gettempdir()) / f"vless-boost-update-{version}"
+    tmp.mkdir(parents=True, exist_ok=True)
+    lower = url.lower()
+    if lower.endswith(".zip"):
+        zip_path = tmp / "update.zip"
+        download_file(url, zip_path)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            names = [n for n in zf.namelist() if n.lower().endswith(".exe")]
+            if not names:
+                raise RuntimeError("В архиве обновления нет .exe")
+            # предпочитаем VLESS-Boost.exe
+            names.sort(key=lambda n: (0 if "vless-boost" in n.lower() else 1, n))
+            target_name = Path(names[0]).name
+            zf.extract(names[0], tmp)
+            extracted = tmp / names[0]
+            # если был подкаталог — перенесём в корень tmp
+            final = tmp / target_name
+            if extracted.resolve() != final.resolve():
+                final.write_bytes(extracted.read_bytes())
+            return final
+    exe_path = tmp / f"VLESS-Boost-{version}.exe"
+    return download_file(url, exe_path)
