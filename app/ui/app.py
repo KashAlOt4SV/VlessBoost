@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 import threading
 
 import customtkinter as ctk
@@ -62,6 +63,10 @@ class BoosterApp(ctk.CTk):
         self._minimizing_to_tray = False
         self._current_page = "home"
         self._resize_after: str | None = None
+        self._resize_end_after: str | None = None
+        self._last_win_size: tuple[int, int] | None = None
+        self._resize_shield_on = False
+        self._ui_frozen = False
 
         trim_log_file()
 
@@ -74,15 +79,10 @@ class BoosterApp(ctk.CTk):
         self.bind("<Map>", self._on_map)
         self._apply_window_icons()
 
-        try:
-            self.attributes("-alpha", 0.0)
-        except Exception:
-            pass
-
         self._build()
         with perf("startup refresh_status"):
             self._refresh_status()
-        self.after(20, self._startup_fade_in)
+        self.after(0, self._finish_startup)
         self.after(600, self._maybe_admin_prompt)
         self.after(900, self._check_orphan_on_startup)
 
@@ -179,22 +179,114 @@ class BoosterApp(ctk.CTk):
         self._show_page("home")
         self._refresh_server_labels()
         self.bind("<Configure>", self._on_window_configure)
+        self.after(50, self._harden_window_compositor)
+
+    def _finish_startup(self) -> None:
+        # No alpha fade — translucent frames cause DWM ghosting/blur artifacts.
+        try:
+            self.attributes("-alpha", 1.0)
+        except Exception:
+            pass
+        self._power_glow = 100
+        self._set_power_visual()
+
+    def _harden_window_compositor(self) -> None:
+        """Reduce Windows DWM transition artifacts on resize/move."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            hwnd = wintypes.HWND(int(self.winfo_id()))
+            # DWMWA_TRANSITIONS_FORCEDISABLED = 3
+            val = ctypes.c_int(1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(  # type: ignore[attr-defined]
+                hwnd, 3, ctypes.byref(val), ctypes.sizeof(val)
+            )
+        except Exception:
+            pass
+
+    def _set_widget_redraw(self, widget, enabled: bool) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            hwnd = int(widget.winfo_id())
+            # WM_SETREDRAW = 0x000B
+            ctypes.windll.user32.SendMessageW(hwnd, 0x000B, 1 if enabled else 0, 0)  # type: ignore[attr-defined]
+            if enabled:
+                try:
+                    widget.update_idletasks()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _ensure_resize_cover(self):
+        if getattr(self, "_resize_cover", None) is None:
+            self._resize_cover = ctk.CTkFrame(
+                self.main, fg_color=COLORS["bg"], corner_radius=0, border_width=0
+            )
+        return self._resize_cover
+
+    def _begin_resize_shield(self) -> None:
+        if self._resize_shield_on:
+            return
+        self._resize_shield_on = True
+        self._ui_frozen = True
+        # Pause timers that force widget reconfigure mid-resize
+        self._stop_status_blink()
+        try:
+            cover = self._ensure_resize_cover()
+            cover.place(relx=0, rely=0, relwidth=1, relheight=1)
+            cover.lift()
+            # Paint cover once before the next resize storm
+            cover.update_idletasks()
+        except Exception:
+            pass
+
+    def _end_resize_shield(self) -> None:
+        self._resize_end_after = None
+        if not self._resize_shield_on:
+            return
+        self._resize_shield_on = False
+        self._ui_frozen = False
+        try:
+            if getattr(self, "_resize_cover", None) is not None:
+                self._resize_cover.place_forget()
+            # Force one clean composite after uncover
+            self.main.update_idletasks()
+        except Exception:
+            pass
+        if self.manager.running:
+            self._start_status_blink()
+        # Single layout pass after resize settles
+        if self._current_page == "boost" and self._view_mode == "cards" and self._catalog_built:
+            cols = self._catalog_columns()
+            if cols != self._catalog_cols:
+                self._relayout_catalog_columns()
 
     def _on_window_configure(self, event) -> None:
         if event.widget is not self:
             return
-        # Resize must never refetch data — only maybe reflow visible catalog columns.
-        if self._current_page != "boost" or self._view_mode != "cards" or not self._catalog_built:
+        size = (int(event.width), int(event.height))
+        prev = self._last_win_size
+        self._last_win_size = size
+        if prev is None:
             return
-        cols = self._catalog_columns()
-        if cols == self._catalog_cols:
+        # Ignore pure moves (same size) — only shield on actual resize
+        if size == prev:
             return
-        if self._resize_after:
+        self._begin_resize_shield()
+        if self._resize_end_after:
             try:
-                self.after_cancel(self._resize_after)
+                self.after_cancel(self._resize_end_after)
             except Exception:
                 pass
-        self._resize_after = self.after(180, self._relayout_catalog_columns)
+        # Settle after last resize event — one clean paint, no mid-drag redraw storms
+        self._resize_end_after = self.after(140, self._end_resize_shield)
 
     def _catalog_columns(self) -> int:
         try:
@@ -209,6 +301,8 @@ class BoosterApp(ctk.CTk):
 
     def _relayout_catalog_columns(self) -> None:
         self._resize_after = None
+        if self._ui_frozen:
+            return
         if self._current_page != "boost" or self._view_mode != "cards" or not self._items:
             return
         cols = self._catalog_columns()
@@ -235,10 +329,15 @@ class BoosterApp(ctk.CTk):
                 elif name == "home":
                     self._refresh_home_services()
                 return
-            for p in pages.values():
-                p.pack_forget()
-            pages[name].pack(fill="both", expand=True, padx=24, pady=18)
-            self._current_page = name
+            # Freeze redraw during page swap to avoid tear/ghost frames
+            self._set_widget_redraw(self.main, False)
+            try:
+                for p in pages.values():
+                    p.pack_forget()
+                pages[name].pack(fill="both", expand=True, padx=24, pady=18)
+                self._current_page = name
+            finally:
+                self._set_widget_redraw(self.main, True)
             if hasattr(self, "sidebar"):
                 self.sidebar.set_active(name)
             if name == "boost":
@@ -355,7 +454,7 @@ class BoosterApp(ctk.CTk):
 
         self.home_services = ctk.CTkScrollableFrame(
             page,
-            fg_color="transparent",
+            fg_color=COLORS["bg"],
             corner_radius=0,
             scrollbar_button_color=COLORS["border"],
             scrollbar_button_hover_color=COLORS["accent_dim"],
@@ -664,7 +763,7 @@ class BoosterApp(ctk.CTk):
 
         self.catalog_host = ctk.CTkScrollableFrame(
             page,
-            fg_color="transparent",
+            fg_color=COLORS["bg"],
             corner_radius=0,
             scrollbar_button_color=COLORS["border"],
             scrollbar_button_hover_color=COLORS["accent_dim"],
@@ -1110,6 +1209,9 @@ class BoosterApp(ctk.CTk):
     def _tick_session(self) -> None:
         self._session_after = None
         if not self.manager.running:
+            return
+        if self._ui_frozen or self._resize_shield_on:
+            self._session_after = self.after(1000, self._tick_session)
             return
         text = self._session_text()
         if hasattr(self, "side_session_lbl"):
@@ -1698,7 +1800,7 @@ class BoosterApp(ctk.CTk):
         self._status_blink_after = None
         if not self.manager.running:
             return
-        if not self.winfo_viewable():
+        if self._ui_frozen or self._resize_shield_on or not self.winfo_viewable():
             self._status_blink_after = self.after(1000, self._tick_status_blink)
             return
         self._status_blink_bright = not self._status_blink_bright
@@ -1746,38 +1848,6 @@ class BoosterApp(ctk.CTk):
             self._logo_refs.append(img)
         return self._power_images[key]
 
-    def _startup_fade_in(self) -> None:
-        # Fewer alpha steps: translucent intermediate frames cause blur/ghosting.
-        def step(a: float = 0.0) -> None:
-            a = min(1.0, a + 0.25)
-            try:
-                self.attributes("-alpha", a)
-            except Exception:
-                return
-            if a < 1.0:
-                self.after(16, lambda: step(a))
-            else:
-                self._pulse_power_intro()
-
-        step()
-
-    def _pulse_power_intro(self) -> None:
-        # Brief glow pulse on first paint
-        frames = [70, 90, 115, 130, 110, 100]
-        idx = {"i": 0}
-
-        def tick() -> None:
-            if idx["i"] >= len(frames) or self.manager.running:
-                self._power_glow = 100
-                self._set_power_visual()
-                return
-            self._power_glow = frames[idx["i"]]
-            idx["i"] += 1
-            self._set_power_visual()
-            self._power_anim_after = self.after(55, tick)
-
-        tick()
-
     def _start_connect_animation(self) -> None:
         self._stop_connect_animation()
         phase = {"t": 0}
@@ -1817,9 +1887,17 @@ class BoosterApp(ctk.CTk):
         except Exception:
             pass
 
-    def _on_map(self, _event=None) -> None:
+    def _on_map(self, event=None) -> None:
         # Restore from minimize/tray must NOT reload lists or rebuild catalog.
+        if event is not None and getattr(event, "widget", None) is not self:
+            return
         self._minimizing_to_tray = False
+        # Brief shield avoids ghost frames from DWM restore composite
+        try:
+            self._begin_resize_shield()
+            self.after(100, self._end_resize_shield)
+        except Exception:
+            pass
 
     def _minimize_to_tray(self) -> None:
         try:

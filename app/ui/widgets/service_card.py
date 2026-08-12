@@ -34,6 +34,7 @@ class ServiceCard(ctk.CTkFrame):
         self._visible = True
         self._grid_info: dict | None = None
         self._grid_key: tuple | None = None
+        self._hover = False
 
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=16, pady=(14, 6))
@@ -77,14 +78,24 @@ class ServiceCard(ctk.CTkFrame):
             wraplength=260,
         ).pack(fill="x", padx=16, pady=(0, 14))
 
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
+        self.bind("<Enter>", self._on_enter, add="+")
+        self.bind("<Leave>", self._on_leave, add="+")
 
     def _on_enter(self, _e=None) -> None:
-        if not self.var.get():
-            self.configure(fg_color=COLORS["card_hover"], border_color=COLORS["border_hover"])
+        if self.var.get() or self._hover:
+            return
+        self._hover = True
+        self.configure(fg_color=COLORS["card_hover"], border_color=COLORS["border_hover"])
 
     def _on_leave(self, _e=None) -> None:
+        try:
+            x, y = self.winfo_pointerxy()
+            wx, wy = self.winfo_rootx(), self.winfo_rooty()
+            if wx <= x <= wx + self.winfo_width() and wy <= y <= wy + self.winfo_height():
+                return
+        except Exception:
+            pass
+        self._hover = False
         self._style(bool(self.var.get()))
 
     def _style(self, on: bool) -> None:
@@ -95,6 +106,7 @@ class ServiceCard(ctk.CTkFrame):
 
     def _changed(self) -> None:
         on = bool(self.var.get())
+        self._hover = False
         self._style(on)
         self.on_toggle(self.preset.id, on)
 
