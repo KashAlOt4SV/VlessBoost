@@ -17,6 +17,7 @@ build-release/
 dist/
 dist-preview*/
 dist-release/
+dist-release-*/
 *.spec.bak
 *.zip
 

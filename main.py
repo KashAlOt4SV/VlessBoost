@@ -26,6 +26,7 @@ def _windows_app_id() -> None:
 _windows_app_id()
 
 from app.paths import CONFIG_DIR, LOG_PATH
+from app.single_instance import ensure_single_instance, notify_already_running
 from app.ui import run_app
 
 
@@ -48,8 +49,23 @@ def setup_logging() -> None:
 
 
 def main() -> int:
+    if not ensure_single_instance():
+        notify_already_running()
+        return 0
+
     setup_logging()
-    logging.getLogger(__name__).info("VLESS Boost starting")
+    log = logging.getLogger(__name__)
+    log.info("VLESS Boost starting")
+
+    try:
+        from app.updater import apply_pending_update_on_startup
+
+        if apply_pending_update_on_startup():
+            log.info("Exiting to apply pending OTA update")
+            return 0
+    except Exception:
+        log.exception("pending update check failed")
+
     run_app()
     return 0
 

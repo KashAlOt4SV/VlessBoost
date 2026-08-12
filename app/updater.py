@@ -1,9 +1,13 @@
-"""Простая проверка обновлений по version.json."""
+"""Простая проверка обновлений по version.json + in-place install для Windows."""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -13,16 +17,20 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app import __version__
+from app.paths import CONFIG_DIR
 
 logger = logging.getLogger(__name__)
 
 # Dual-fetch: raw GitHub (short cache) + jsDelivr (often stale on @main).
-# Keep first URL as the preferred source; pick the newer windows.version.
 MANIFEST_URLS = (
     "https://raw.githubusercontent.com/KashAlOt4SV/VlessBoost/main/update/version.json",
     "https://cdn.jsdelivr.net/gh/KashAlOt4SV/VlessBoost@main/update/version.json",
 )
 MANIFEST_URL = MANIFEST_URLS[0]
+
+UPDATES_DIR = CONFIG_DIR / "updates"
+PENDING_PATH = UPDATES_DIR / "pending.json"
+STAGED_EXE_NAME = "VLESS-Boost.exe"
 
 
 @dataclass
@@ -46,7 +54,7 @@ def _fetch_manifest(url: str) -> dict | None:
     req = urllib.request.Request(
         bust,
         headers={
-            "User-Agent": "VLESS-Boost-Updater/1.1",
+            "User-Agent": "VLESS-Boost-Updater/1.2",
             "Cache-Control": "no-cache",
             "Accept": "application/json",
         },
@@ -91,7 +99,7 @@ def download_file(url: str, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "VLESS-Boost-Updater/1.1"},
+        headers={"User-Agent": "VLESS-Boost-Updater/1.2"},
     )
     try:
         with urllib.request.urlopen(req, timeout=180) as resp, open(dest, "wb") as out:
@@ -107,17 +115,64 @@ def download_file(url: str, dest: Path) -> Path:
     return dest
 
 
+def _install_exe_path() -> Path:
+    """Canonical install target next to the running frozen exe."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "VLESS-Boost.exe"
+    return Path.cwd() / "VLESS-Boost.exe"
+
+
+def stage_update_exe(src_exe: Path, version: str) -> Path:
+    """Copy downloaded exe into AppData\\VLESS-Boost\\updates and write pending marker."""
+    UPDATES_DIR.mkdir(parents=True, exist_ok=True)
+    staged = UPDATES_DIR / STAGED_EXE_NAME
+    src_exe = Path(src_exe).resolve()
+    if src_exe.resolve() != staged.resolve():
+        shutil.copy2(src_exe, staged)
+    install_exe = str(_install_exe_path()) if getattr(sys, "frozen", False) else ""
+    pending = {
+        "version": version,
+        "staged": str(staged),
+        "install_exe": install_exe,
+        "created_at": int(time.time()),
+    }
+    PENDING_PATH.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("staged update %s -> %s (install=%s)", version, staged, install_exe)
+    return staged
+
+
+def clear_pending_update() -> None:
+    try:
+        if PENDING_PATH.exists():
+            PENDING_PATH.unlink()
+    except OSError:
+        pass
+
+
+def read_pending_update() -> dict | None:
+    if not PENDING_PATH.exists():
+        return None
+    try:
+        data = json.loads(PENDING_PATH.read_text(encoding="utf-8"))
+        staged = Path(str(data.get("staged") or ""))
+        if not staged.is_file() or staged.stat().st_size < 1000:
+            return None
+        return data
+    except Exception:
+        return None
+
+
 def download_update_to_temp(url: str, version: str) -> Path:
-    """Скачивает .exe или .zip (с exe внутри) во временную папку."""
+    """Download .exe/.zip, then stage into AppData updates (not only Temp)."""
     tmp = Path(tempfile.gettempdir()) / f"vless-boost-update-{version}"
-    if tmp.exists():
-        for p in tmp.glob("*"):
-            try:
-                if p.is_file():
-                    p.unlink()
-            except OSError:
-                pass
     tmp.mkdir(parents=True, exist_ok=True)
+    for p in tmp.glob("*"):
+        try:
+            if p.is_file():
+                p.unlink()
+        except OSError:
+            pass
+
     lower = url.split("?", 1)[0].lower()
     logger.info("download update: %s", url)
     if lower.endswith(".zip"):
@@ -131,64 +186,147 @@ def download_update_to_temp(url: str, version: str) -> Path:
             member = names[0]
             zf.extract(member, tmp)
             extracted = tmp / member
-            final = tmp / Path(member).name
-            if extracted.resolve() != final.resolve():
-                final.write_bytes(extracted.read_bytes())
-            if not final.exists() or final.stat().st_size < 1000:
-                raise RuntimeError("Скачанный exe повреждён или пуст")
-            return final
-    exe_path = tmp / f"VLESS-Boost-{version}.exe"
-    download_file(url, exe_path)
-    if exe_path.stat().st_size < 1000:
-        raise RuntimeError("Скачанный файл слишком маленький — проверьте URL релиза")
-    return exe_path
+            downloaded = tmp / Path(member).name
+            if extracted.resolve() != downloaded.resolve():
+                downloaded.write_bytes(extracted.read_bytes())
+    else:
+        downloaded = tmp / f"VLESS-Boost-{version}.exe"
+        download_file(url, downloaded)
+
+    if not downloaded.exists() or downloaded.stat().st_size < 1000:
+        raise RuntimeError("Скачанный exe повреждён или пуст")
+    return stage_update_exe(downloaded, version)
+
+
+def _write_apply_bat(*, src: Path, dst: Path, wait_pid: int) -> Path:
+    """Bat that waits for our PID to exit, replaces install exe, relaunches."""
+    bat = UPDATES_DIR / "apply-update.bat"
+    UPDATES_DIR.mkdir(parents=True, exist_ok=True)
+    # Use ASCII-only paths in bat; quote carefully for cmd.
+    src_s = str(src)
+    dst_s = str(dst)
+    old_s = str(dst) + ".old"
+    pending_s = str(PENDING_PATH)
+    log_s = str(UPDATES_DIR / "apply.log")
+    lines = [
+        "@echo off",
+        "setlocal EnableExtensions",
+        f'set "SRC={src_s}"',
+        f'set "DST={dst_s}"',
+        f'set "OLD={old_s}"',
+        f'set "PENDING={pending_s}"',
+        f'set "LOG={log_s}"',
+        f"set PID={int(wait_pid)}",
+        'echo apply start %DATE% %TIME%>>"%LOG%"',
+        ":wait",
+        'tasklist /FI "PID eq %PID%" 2>nul | findstr /C:"%PID%" >nul',
+        "if not errorlevel 1 (",
+        "  ping 127.0.0.1 -n 2 >nul",
+        "  goto wait",
+        ")",
+        "ping 127.0.0.1 -n 2 >nul",
+        'if exist "%OLD%" del /f /q "%OLD%" >nul 2>&1',
+        'if exist "%DST%" move /y "%DST%" "%OLD%" >nul 2>&1',
+        'copy /y "%SRC%" "%DST%" >nul',
+        "if errorlevel 1 (",
+        '  echo copy failed>>"%LOG%"',
+        '  if exist "%OLD%" move /y "%OLD%" "%DST%" >nul 2>&1',
+        "  exit /b 1",
+        ")",
+        'del /f /q "%OLD%" >nul 2>&1',
+        'del /f /q "%PENDING%" >nul 2>&1',
+        'echo ok>>"%LOG%"',
+        'start "" "%DST%"',
+        'del /f /q "%~f0" >nul 2>&1',
+        "endlocal",
+        "exit /b 0",
+        "",
+    ]
+    bat.write_text("\r\n".join(lines), encoding="utf-8")
+    return bat
+
+
+def _spawn_detached_bat(bat: Path) -> None:
+    """Launch updater bat so it survives parent process exit."""
+    creation = 0
+    if sys.platform == "win32":
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — don't die with parent
+        creation = 0x00000008 | 0x00000200
+    subprocess.Popen(
+        ["cmd.exe", "/c", str(bat)],
+        cwd=str(bat.parent),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=creation,
+        shell=False,
+    )
 
 
 def apply_windows_update(new_exe: Path) -> Path:
-    """Replace the running frozen exe in-place via a helper .bat, then relaunch.
+    """Prepare in-place replace of the installed VLESS-Boost.exe.
 
-    Settings live in %LOCALAPPDATA%\\VLESS-Boost and are NOT touched.
-    Returns the path of the batch launcher (caller should start it and exit).
+    Returns path of the apply .bat (caller starts it detached and exits).
+    Settings in %LOCALAPPDATA%\\VLESS-Boost are not touched.
     """
-    import sys
-    import textwrap
-
     new_exe = Path(new_exe).resolve()
     if not new_exe.exists():
         raise RuntimeError(f"Файл обновления не найден: {new_exe}")
 
     if not getattr(sys, "frozen", False):
-        # Dev mode: just run the downloaded binary
+        # Dev: stage only; return exe path for manual run
         return new_exe
 
-    target = Path(sys.executable).resolve()
-    # Always install as VLESS-Boost.exe next to current install dir
-    install_dir = target.parent
-    final_exe = install_dir / "VLESS-Boost.exe"
-    bat = Path(tempfile.gettempdir()) / "vless-boost-apply-update.bat"
-    # Wait until old process releases the file, copy, start new, cleanup.
-    script = textwrap.dedent(
-        f"""
-        @echo off
-        setlocal
-        set "SRC={new_exe}"
-        set "DST={final_exe}"
-        set "OLD={target}"
-        :wait
-        ping 127.0.0.1 -n 2 >nul
-        del /f /q "%OLD%" >nul 2>&1
-        if exist "%OLD%" goto wait
-        copy /y "%SRC%" "%DST%" >nul
-        if errorlevel 1 (
-          echo Failed to copy update
-          pause
-          exit /b 1
-        )
-        start "" "%DST%"
-        del /f /q "%~f0" >nul 2>&1
-        endlocal
-        """
-    ).strip() + "\n"
-    bat.write_text(script, encoding="utf-8")
-    logger.info("update bat ready: %s -> %s", new_exe, final_exe)
+    dst = _install_exe_path()
+    # Ensure staged copy exists under AppData
+    version = __version__
+    pending = read_pending_update()
+    if pending and pending.get("version"):
+        version = str(pending["version"])
+    staged = stage_update_exe(new_exe, version)
+    bat = _write_apply_bat(src=staged, dst=dst, wait_pid=os.getpid())
+    logger.info("update bat ready: %s -> %s (pid=%s)", staged, dst, os.getpid())
     return bat
+
+
+def launch_apply_and_exit(bat: Path) -> None:
+    """Start apply bat detached and terminate this process."""
+    _spawn_detached_bat(Path(bat))
+    # Hard exit so file lock on running exe is released for the bat
+    os._exit(0)
+
+
+def apply_pending_update_on_startup() -> bool:
+    """If a staged update is pending, apply it now and exit.
+
+    Returns True if this process should stop (updater launched).
+    """
+    if not getattr(sys, "frozen", False):
+        return False
+    pending = read_pending_update()
+    if not pending:
+        return False
+    staged = Path(str(pending.get("staged") or ""))
+    if not staged.is_file():
+        clear_pending_update()
+        return False
+    remote_ver = str(pending.get("version") or "")
+    if remote_ver and _parse_ver(remote_ver) <= _parse_ver(__version__):
+        # Already running the staged version (or newer)
+        clear_pending_update()
+        return False
+    install = Path(str(pending.get("install_exe") or "")) or _install_exe_path()
+    # Only auto-apply when install path matches our folder (same install)
+    running = Path(sys.executable).resolve()
+    if install.resolve().parent != running.parent:
+        # Still allow apply into install path from pending
+        pass
+    try:
+        bat = _write_apply_bat(src=staged, dst=install.resolve(), wait_pid=os.getpid())
+        logger.info("startup: applying pending update %s", remote_ver)
+        _spawn_detached_bat(bat)
+        return True
+    except Exception:
+        logger.exception("failed to apply pending update")
+        return False

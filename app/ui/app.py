@@ -1528,9 +1528,8 @@ class BoosterApp(ctk.CTk):
                     apply_windows_update,
                     check_windows_update,
                     download_update_to_temp,
+                    launch_apply_and_exit,
                 )
-                import os
-                import subprocess
 
                 # Persist link/settings before replacing the exe
                 try:
@@ -1557,25 +1556,31 @@ class BoosterApp(ctk.CTk):
 
                 def ask() -> None:
                     self._busy = False
-                    self.update_log.insert("end", f"Скачано: {path}\n")
+                    self.update_log.insert("end", f"Скачано и сохранено: {path}\n")
                     self.update_log.insert(
                         "end",
-                        "Настройки (ссылка VPN) хранятся в %LOCALAPPDATA%\\VLESS-Boost и сохранятся.\n",
+                        "Установка заменит VLESS-Boost.exe в папке программы "
+                        "(не Temp). Настройки в %LOCALAPPDATA%\\VLESS-Boost сохранятся.\n",
                     )
                     if messagebox.askyesno(
                         "Обновление",
-                        f"Версия {upd.version} скачана.\n"
-                        "Установить на место текущей программы?\n"
-                        "(ссылка VPN и настройки сохранятся)",
+                        f"Версия {upd.version} готова.\n\n"
+                        "Установить сейчас?\n"
+                        "Программа закроется, заменит exe в этой папке и запустится снова.\n"
+                        "Если отменить — установка выполнится при следующем запуске.",
                         parent=self,
                     ):
-                        subprocess.Popen(
-                            ["cmd.exe", "/c", str(launcher)],
-                            shell=False,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        try:
+                            self.destroy()
+                        except Exception:
+                            pass
+                        launch_apply_and_exit(launcher)
+                    else:
+                        self.update_log.insert(
+                            "end",
+                            "Отложено: при следующем запуске обновление установится автоматически.\n",
                         )
-                        self.destroy()
-                        os._exit(0)
+                        self.update_log.see("end")
 
                 self.after(0, ask)
             except Exception as exc:
