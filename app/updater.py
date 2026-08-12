@@ -142,3 +142,53 @@ def download_update_to_temp(url: str, version: str) -> Path:
     if exe_path.stat().st_size < 1000:
         raise RuntimeError("Скачанный файл слишком маленький — проверьте URL релиза")
     return exe_path
+
+
+def apply_windows_update(new_exe: Path) -> Path:
+    """Replace the running frozen exe in-place via a helper .bat, then relaunch.
+
+    Settings live in %LOCALAPPDATA%\\VLESS-Boost and are NOT touched.
+    Returns the path of the batch launcher (caller should start it and exit).
+    """
+    import sys
+    import textwrap
+
+    new_exe = Path(new_exe).resolve()
+    if not new_exe.exists():
+        raise RuntimeError(f"Файл обновления не найден: {new_exe}")
+
+    if not getattr(sys, "frozen", False):
+        # Dev mode: just run the downloaded binary
+        return new_exe
+
+    target = Path(sys.executable).resolve()
+    # Always install as VLESS-Boost.exe next to current install dir
+    install_dir = target.parent
+    final_exe = install_dir / "VLESS-Boost.exe"
+    bat = Path(tempfile.gettempdir()) / "vless-boost-apply-update.bat"
+    # Wait until old process releases the file, copy, start new, cleanup.
+    script = textwrap.dedent(
+        f"""
+        @echo off
+        setlocal
+        set "SRC={new_exe}"
+        set "DST={final_exe}"
+        set "OLD={target}"
+        :wait
+        ping 127.0.0.1 -n 2 >nul
+        del /f /q "%OLD%" >nul 2>&1
+        if exist "%OLD%" goto wait
+        copy /y "%SRC%" "%DST%" >nul
+        if errorlevel 1 (
+          echo Failed to copy update
+          pause
+          exit /b 1
+        )
+        start "" "%DST%"
+        del /f /q "%~f0" >nul 2>&1
+        endlocal
+        """
+    ).strip() + "\n"
+    bat.write_text(script, encoding="utf-8")
+    logger.info("update bat ready: %s -> %s", new_exe, final_exe)
+    return bat

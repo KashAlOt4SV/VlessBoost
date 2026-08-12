@@ -50,8 +50,25 @@ def _create_no_window() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def list_singbox_processes() -> list[tuple[int, str]]:
-    """Все процессы sing-box.exe: (pid, executable_path)."""
+_PROCESS_CACHE: tuple[float, list[tuple[int, str]]] | None = None
+_PROCESS_CACHE_TTL = 2.5
+
+
+def list_singbox_processes(*, force: bool = False) -> list[tuple[int, str]]:
+    """Все процессы sing-box.exe: (pid, executable_path).
+
+    Results are cached briefly so repeated UI status checks do not spawn
+    PowerShell on every paint / page switch / restore.
+    """
+    global _PROCESS_CACHE
+    now = time.monotonic()
+    if (
+        not force
+        and _PROCESS_CACHE is not None
+        and (now - _PROCESS_CACHE[0]) < _PROCESS_CACHE_TTL
+    ):
+        return list(_PROCESS_CACHE[1])
+
     ps = (
         "Get-CimInstance Win32_Process -Filter \"Name = 'sing-box.exe'\" | "
         "Select-Object ProcessId, ExecutablePath | ConvertTo-Json -Compress"
@@ -69,14 +86,16 @@ def list_singbox_processes() -> list[tuple[int, str]]:
         return []
     text = (out.stdout or "").strip()
     if not text:
-        return []
+        result: list[tuple[int, str]] = []
+        _PROCESS_CACHE = (now, result)
+        return result
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
         return []
     if isinstance(data, dict):
         data = [data]
-    result: list[tuple[int, str]] = []
+    result = []
     for row in data:
         try:
             pid = int(row.get("ProcessId") or 0)
@@ -86,14 +105,15 @@ def list_singbox_processes() -> list[tuple[int, str]]:
             continue
         path = str(row.get("ExecutablePath") or "").strip()
         result.append((pid, path))
-    return result
+    _PROCESS_CACHE = (now, result)
+    return list(result)
 
 
-def list_our_singbox_processes() -> list[tuple[int, str]]:
+def list_our_singbox_processes(*, force: bool = False) -> list[tuple[int, str]]:
     """sing-box из нашей папки bin/ (или без пути — считаем своим)."""
     our = SINGBOX_EXE.resolve()
     found: list[tuple[int, str]] = []
-    for pid, path in list_singbox_processes():
+    for pid, path in list_singbox_processes(force=force):
         if not path:
             found.append((pid, path))
             continue
@@ -114,6 +134,7 @@ def list_our_singbox_processes() -> list[tuple[int, str]]:
 
 def kill_pids(pids: list[int]) -> list[int]:
     """Убивает процессы, возвращает список успешно завершённых pid."""
+    global _PROCESS_CACHE
     killed: list[int] = []
     for pid in pids:
         try:
@@ -128,6 +149,7 @@ def kill_pids(pids: list[int]) -> list[int]:
         except Exception as exc:
             logger.warning("taskkill %s failed: %s", pid, exc)
     time.sleep(0.4)
+    _PROCESS_CACHE = None
     return killed
 
 
@@ -146,16 +168,20 @@ class SingBoxManager:
             return self._proc.pid
         return None
 
-    def external_instances(self) -> list[tuple[int, str]]:
+    def external_instances(self, *, force: bool = False) -> list[tuple[int, str]]:
         """Чужие/зависшие sing-box (не наш текущий Popen)."""
         mine = self.managed_pid()
-        return [(pid, path) for pid, path in list_our_singbox_processes() if pid != mine]
+        return [
+            (pid, path)
+            for pid, path in list_our_singbox_processes(force=force)
+            if pid != mine
+        ]
 
-    def has_external_instance(self) -> bool:
-        return bool(self.external_instances())
+    def has_external_instance(self, *, force: bool = False) -> bool:
+        return bool(self.external_instances(force=force))
 
     def kill_external(self) -> list[int]:
-        pids = [pid for pid, _ in self.external_instances()]
+        pids = [pid for pid, _ in self.external_instances(force=True)]
         if not pids:
             return []
         killed = kill_pids(pids)

@@ -142,6 +142,54 @@ def make_preset_icon(preset_id: str, color: str, size: int = 40) -> Image.Image:
     return canvas
 
 
+@lru_cache(maxsize=16)
+def make_power_button_image(size: int = 168, *, on: bool = False, glow: int = 100) -> Image.Image:
+    """Power button from app/image/logo/power_button.png (user asset)."""
+    path = LOGO_DIR / "power_button.png"
+    if not path.exists():
+        path = IMAGE_DIR / "power_button.png"
+    if not path.exists():
+        # Minimal fallback if asset missing
+        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(canvas)
+        ring = (0, 229, 255, 255) if on else (0, 40, 70, 255)
+        draw.arc((size * 0.18, size * 0.22, size * 0.82, size * 0.86), 40, 320, fill=ring, width=max(6, size // 14))
+        stem = (255, 255, 255, 255) if on else (97, 207, 192, 255)
+        cx = size // 2
+        draw.line((cx, size * 0.18, cx, size * 0.48), fill=stem, width=max(6, size // 14))
+        return canvas
+
+    img = Image.open(path).convert("RGBA")
+    pixels = img.load()
+    w, h = img.size
+    # Drop near-black background so it sits cleanly on the app panel
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = pixels[x, y]
+            if a and r < 18 and g < 18 and b < 18:
+                pixels[x, y] = (0, 0, 0, 0)
+
+    if on:
+        # Active: navy ring → bright cyan, cyan stem → white
+        for y in range(h):
+            for x in range(w):
+                r, g, b, a = pixels[x, y]
+                if a < 8:
+                    continue
+                # Dark navy ring
+                if b > r + 15 and b > g + 10 and r < 50 and g < 60:
+                    pixels[x, y] = (0, 229, 255, a)
+                # Cyan stem
+                elif g > 140 and b > 140 and r < 160:
+                    pixels[x, y] = (255, 255, 255, a)
+
+    if img.size != (size, size):
+        img = img.resize((size, size), Image.Resampling.LANCZOS)
+    # glow kept for API compat / cache key; asset itself is flat
+    _ = glow
+    return img
+
+
 def build_app_ico(dest: Path | None = None) -> Path:
     """Multi-size ICO из app/image/logo/logo_*.png"""
     dest = dest or (LOGO_DIR / "app.ico")

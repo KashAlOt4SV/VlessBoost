@@ -31,6 +31,12 @@ from app.ui import run_app
 
 def setup_logging() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        from app.ui import trim_log_file
+
+        trim_log_file()
+    except Exception:
+        pass
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

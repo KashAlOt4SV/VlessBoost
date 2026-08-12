@@ -12,8 +12,13 @@ config/app.log
 config/cache/
 presets/user_overrides.json
 build/
+build-preview*/
+build-release/
 dist/
+dist-preview*/
+dist-release/
 *.spec.bak
+*.zip
 
 # Android
 android/.gradle/
