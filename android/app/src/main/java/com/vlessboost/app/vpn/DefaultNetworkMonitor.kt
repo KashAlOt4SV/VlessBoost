@@ -11,20 +11,20 @@ import android.os.Looper
 import android.util.Log
 import com.vlessboost.app.LogStore
 import io.nekohasekai.libbox.InterfaceUpdateListener
+import java.lang.ref.WeakReference
 
 /**
- * Следит за реальной сетью (Wi‑Fi/LTE), исключая VPN, и отдаёт её в
- * [VpnService.Builder.setUnderlyingNetworks].
+ * Следит за реальной сетью (Wi‑Fi/LTE), исключая VPN.
  *
- * Важно (Wi‑Fi crash 1.1.7):
- * - НЕ вызываем InterfaceUpdateListener.updateDefaultInterface / Libbox.updateDefaultInterface.
- *   На Wi‑Fi (wlan0 + rmnet одновременно, IPv4+IPv6) нативный путь в libbox убивал процесс;
- *   на cellular тот же путь обычно жил. Cellular/Wi‑Fi outbound держим через
- *   setUnderlyingNetworks + VpnService.protect().
- * - Callback'и только обновляют [underlying]; Go iface push отключён навсегда.
+ * - Обновляет [underlying] и дергает [UnderlyingNetworkSink] → VpnService.setUnderlyingNetworks.
+ * - НЕ вызывает InterfaceUpdateListener.updateDefaultInterface (Wi‑Fi crash в libbox).
  */
 object DefaultNetworkMonitor {
     private const val TAG = "DefaultNetMon"
+
+    fun interface UnderlyingNetworkSink {
+        fun onUnderlyingNetworkChanged(network: Network?)
+    }
 
     @Volatile
     var underlying: Network? = null
@@ -32,6 +32,9 @@ object DefaultNetworkMonitor {
 
     @Volatile
     private var listener: InterfaceUpdateListener? = null
+
+    @Volatile
+    private var sinkRef: WeakReference<UnderlyingNetworkSink>? = null
 
     private var registered = false
     private var cm: ConnectivityManager? = null
@@ -47,8 +50,9 @@ object DefaultNetworkMonitor {
             if (networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
             if (network == underlying) {
                 logTransport(network, "capsChanged")
+                // Re-apply even for same Network — capabilities/validated may have flipped.
+                notifySink(network)
             } else if (networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
-                // Prefer validated default when callback fires for a better match.
                 adopt(network, "capsChanged")
             }
         }
@@ -57,10 +61,19 @@ object DefaultNetworkMonitor {
             if (network != underlying) return
             underlying = null
             LogStore.append("default network lost")
+            notifySink(null)
             val connectivity = cm
             if (connectivity != null) {
                 pickInitial(connectivity)
             }
+        }
+    }
+
+    fun setSink(sink: UnderlyingNetworkSink?) {
+        sinkRef = sink?.let { WeakReference(it) }
+        // Push current uplink immediately so a late-bound service catches up.
+        if (sink != null) {
+            notifySink(underlying)
         }
     }
 
@@ -78,7 +91,6 @@ object DefaultNetworkMonitor {
             }
             .build()
         try {
-            // Только наблюдение — requestNetwork держит сеть и после TUN даёт гонки.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 connectivity.registerBestMatchingNetworkCallback(request, callback, mainHandler)
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -88,7 +100,7 @@ object DefaultNetworkMonitor {
             }
             registered = true
             pickInitial(connectivity)
-            LogStore.append("network monitor started (no Go updateDefaultInterface)")
+            LogStore.append("network monitor started (underlying live updates)")
         } catch (e: Exception) {
             Log.e(TAG, "register failed", e)
             LogStore.append("network monitor error: ${e.message}")
@@ -105,16 +117,16 @@ object DefaultNetworkMonitor {
         underlying = null
         listener = null
         cm = null
+        notifySink(null)
     }
 
-    /**
-     * Раньше включал push в Go после openTun. Теперь no-op: updateDefaultInterface
-     * на Wi‑Fi крашил процесс; underlying Network и так выставляется в openTun.
-     */
     fun setUpdatesEnabled(enabled: Boolean) {
         LogStore.append("network monitor updatesEnabled=$enabled (Go iface push disabled)")
         if (enabled) {
-            underlying?.let { logTransport(it, "armed") }
+            underlying?.let {
+                logTransport(it, "armed")
+                notifySink(it)
+            }
         }
     }
 
@@ -124,7 +136,14 @@ object DefaultNetworkMonitor {
             "network monitor listener=${if (updateListener != null) "set" else "cleared"} " +
                 "(updateDefaultInterface no-op)",
         )
-        // Намеренно НЕ вызываем updateListener.updateDefaultInterface — Wi‑Fi killer.
+    }
+
+    private fun notifySink(network: Network?) {
+        try {
+            sinkRef?.get()?.onUnderlyingNetworkChanged(network)
+        } catch (e: Exception) {
+            LogStore.append("underlying sink error: ${e.message}")
+        }
     }
 
     private fun isVpnNetwork(network: Network): Boolean {
@@ -133,12 +152,17 @@ object DefaultNetworkMonitor {
     }
 
     private fun adopt(network: Network, reason: String) {
+        if (underlying == network) {
+            logTransport(network, reason)
+            notifySink(network)
+            return
+        }
         underlying = network
         logTransport(network, reason)
+        notifySink(network)
     }
 
     private fun pickInitial(connectivity: ConnectivityManager) {
-        // 1) Активная validated default (не VPN)
         val active = connectivity.activeNetwork
         if (active != null) {
             val caps = connectivity.getNetworkCapabilities(active)
@@ -150,7 +174,6 @@ object DefaultNetworkMonitor {
                 return
             }
         }
-        // 2) Первая validated non-VPN с INTERNET
         var fallback: Network? = null
         for (network in connectivity.allNetworks) {
             val caps = connectivity.getNetworkCapabilities(network) ?: continue

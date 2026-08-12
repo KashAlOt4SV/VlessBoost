@@ -4,7 +4,7 @@
     <string name="boost_on">Включить</string>
     <string name="boost_off">Выключить</string>
     <string name="status_off">Выключено</string>
-    <string name="status_on">Включено</string>
+    <string name="status_on">Подключено</string>
     <string name="status_starting">Запуск…</string>
     <string name="vpn_permission">Нужно разрешение VPN</string>
     <string name="need_link">Сначала вставьте ссылку VPN</string>

@@ -67,6 +67,9 @@ object SingBoxConfigBuilder {
             put("uuid", endpoint.uuid)
             if (endpoint.flow.isNotBlank()) put("flow", endpoint.flow)
             put("packet_encoding", "xudp")
+            // Keep TCP session alive through carrier NAT / Wi‑Fi idle (~15–20 min).
+            put("tcp_keep_alive", "25s")
+            put("connect_timeout", "10s")
 
             val security = endpoint.security.lowercase()
             if (security == "tls" || security == "reality") {
@@ -144,7 +147,8 @@ object SingBoxConfigBuilder {
 
         val root = JSONObject().apply {
             put("log", JSONObject().put("level", "info").put("timestamp", true))
-            // DNS выбранных приложений тоже через proxy — иначе часто «висит»
+            // DNS: remote via proxy first; direct as final fallback so a dead VLESS
+            // session cannot black-hole Telegram/YouTube forever.
             put(
                 "dns",
                 JSONObject()
@@ -162,10 +166,18 @@ object SingBoxConfigBuilder {
                                 JSONObject()
                                     .put("type", "udp")
                                     .put("tag", "dns-direct")
-                                    .put("server", "8.8.8.8"),
+                                    .put("server", "8.8.8.8")
+                                    .put("detour", "direct"),
                             ),
                     )
-                    .put("final", if (packages.isNotEmpty()) "dns-remote" else "dns-direct")
+                    .put(
+                        "rules",
+                        JSONArray().put(
+                            JSONObject()
+                                .put("server", "dns-remote"),
+                        ),
+                    )
+                    .put("final", "dns-direct")
                     .put("strategy", "ipv4_only")
                     .put("independent_cache", true),
             )
@@ -182,7 +194,7 @@ object SingBoxConfigBuilder {
                     // false: VpnService setUnderlyingNetworks + protect() выбирают uplink.
                     // auto_detect + updateDefaultInterface(wlan0) на Wi‑Fi крашил процесс (1.1.7).
                     .put("auto_detect_interface", false)
-                    .put("default_domain_resolver", if (packages.isNotEmpty()) "dns-remote" else "dns-direct")
+                    .put("default_domain_resolver", "dns-direct")
                     .put("rules", rules)
                     .put("final", if (packages.isNotEmpty()) "proxy" else "direct"),
             )

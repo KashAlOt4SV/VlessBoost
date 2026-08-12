@@ -11,7 +11,14 @@ import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.text.Editable
+import android.text.TextWatcher
+import android.view.View
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -33,6 +40,20 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: Prefs
     private val scope = CoroutineScope(Dispatchers.Main + Job())
     private var downloadId: Long = -1
+    private var sessionStartedAt: Long = 0L
+    private val handler = Handler(Looper.getMainLooper())
+    private val sessionTick = object : Runnable {
+        override fun run() {
+            if (BoostVpnService.isRunning && sessionStartedAt > 0L) {
+                val sec = ((System.currentTimeMillis() - sessionStartedAt) / 1000).toInt()
+                val h = sec / 3600
+                val m = (sec % 3600) / 60
+                val s = sec % 60
+                binding.sessionTime.text = "%02d:%02d:%02d".format(h, m, s)
+                handler.postDelayed(this, 1000)
+            }
+        }
+    }
 
     private val vpnPermission = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -50,9 +71,7 @@ class MainActivity : AppCompatActivity() {
 
     private val installPermission = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
-    ) {
-        // user returned from unknown sources settings
-    }
+    ) { }
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -91,29 +110,66 @@ class MainActivity : AppCompatActivity() {
         prefs = Prefs(this)
 
         binding.vlessInput.setText(prefs.vlessUrl)
+        binding.vlessInput.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                prefs.vlessUrl = s?.toString().orEmpty()
+                refreshHomeMeta()
+            }
+        })
+
         bindPresets()
         updateAppsSummary()
         updateUi(BoostVpnService.isRunning)
+        showPage(R.id.nav_home)
 
+        binding.bottomNav.setOnItemSelectedListener { item ->
+            when (item.itemId) {
+                R.id.nav_home -> showPage(R.id.nav_home)
+                R.id.nav_services -> showPage(R.id.nav_services)
+                R.id.nav_settings -> showPage(R.id.nav_settings)
+                R.id.nav_logs -> {
+                    startActivity(Intent(this, LogsActivity::class.java))
+                    false
+                }
+                else -> false
+            }
+            true
+        }
+
+        binding.btnHomeSettings.setOnClickListener {
+            binding.bottomNav.selectedItemId = R.id.nav_settings
+        }
+        binding.btnSeeAll.setOnClickListener {
+            binding.bottomNav.selectedItemId = R.id.nav_services
+        }
         binding.btnApps.setOnClickListener {
             startActivity(Intent(this, AppsActivity::class.java))
         }
-        binding.btnLogs.setOnClickListener {
-            startActivity(Intent(this, LogsActivity::class.java))
-        }
         binding.btnUpdate.setOnClickListener { checkUpdate() }
-
-        binding.btnBoost.setOnClickListener {
-            if (BoostVpnService.isRunning) {
-                BoostVpnService.stop(this)
-                updateUi(false)
-            } else {
-                startBoost()
-            }
-        }
+        binding.btnPower.setOnClickListener { toggleBoost() }
 
         if (Build.VERSION.SDK_INT >= 33) {
             notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    private fun showPage(id: Int) {
+        binding.pageHome.visibility = if (id == R.id.nav_home) View.VISIBLE else View.GONE
+        binding.pageServices.visibility = if (id == R.id.nav_services) View.VISIBLE else View.GONE
+        binding.pageSettings.visibility = if (id == R.id.nav_settings) View.VISIBLE else View.GONE
+        if (id == R.id.nav_home) refreshActiveServices()
+    }
+
+    private fun toggleBoost() {
+        if (BoostVpnService.isRunning || binding.btnPower.isSelected) {
+            // Ask service to tear down; UI follows ACTION_STATUS (also optimistic).
+            BoostVpnService.stop(this)
+            updateUi(false)
+            LogStore.append("UI: stop requested")
+        } else {
+            startBoost()
         }
     }
 
@@ -121,6 +177,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         updateAppsSummary()
         updateUi(BoostVpnService.isRunning)
+        refreshActiveServices()
         ContextCompat.registerReceiver(
             this,
             statusReceiver,
@@ -136,8 +193,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        // Persist link when leaving screen
+        prefs.vlessUrl = binding.vlessInput.text?.toString().orEmpty()
         runCatching { unregisterReceiver(statusReceiver) }
         runCatching { unregisterReceiver(downloadReceiver) }
+        handler.removeCallbacks(sessionTick)
         super.onPause()
     }
 
@@ -152,6 +212,7 @@ class MainActivity : AppCompatActivity() {
                 setOnCheckedChangeListener { _, checked ->
                     if (checked) selected.add(preset.id) else selected.remove(preset.id)
                     prefs.selectedPresets = selected
+                    refreshActiveServices()
                 }
             }
             binding.presetChips.addView(chip)
@@ -165,25 +226,84 @@ class MainActivity : AppCompatActivity() {
         } else {
             "Выбрано приложений: $n"
         }
+        binding.appsCountHome.text = n.toString()
+    }
+
+    private fun refreshHomeMeta() {
+        val url = prefs.vlessUrl.trim()
+        val server = try {
+            if (url.isBlank()) "—" else {
+                val ep = VlessParser.parse(url)
+                "${ep.server}:${ep.port}"
+            }
+        } catch (_: Exception) {
+            "сохранена"
+        }
+        binding.homeMeta.text = "Сервер: $server"
+    }
+
+    private fun refreshActiveServices() {
+        val host = binding.activeServicesList
+        host.removeAllViews()
+        val apps = prefs.selectedApps.toList().take(8)
+        val presets = prefs.selectedPresets.mapNotNull { id ->
+            Presets.all.firstOrNull { it.id == id }?.title
+        }
+        val labels = apps.map { it.substringAfterLast('.').replaceFirstChar { c -> c.uppercase() } } + presets
+        if (labels.isEmpty()) {
+            val empty = TextView(this).apply {
+                text = "Пока ничего не выбрано — откройте «Сервисы»."
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.muted))
+                textSize = 13f
+            }
+            host.addView(empty)
+            return
+        }
+        labels.distinct().forEach { title ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setBackgroundResource(R.drawable.bg_card)
+                setPadding(36, 28, 36, 28)
+                val lp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                )
+                lp.topMargin = 12
+                layoutParams = lp
+            }
+            val tv = TextView(this).apply {
+                text = title
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text))
+                textSize = 14f
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            row.addView(tv)
+            host.addView(row)
+        }
+        refreshHomeMeta()
     }
 
     private fun startBoost() {
-        val url = binding.vlessInput.text?.toString()?.trim().orEmpty()
+        val url = binding.vlessInput.text?.toString()?.trim().orEmpty().ifBlank { prefs.vlessUrl.trim() }
         if (url.isBlank()) {
             Toast.makeText(this, R.string.need_link, Toast.LENGTH_SHORT).show()
+            binding.bottomNav.selectedItemId = R.id.nav_settings
             return
         }
         if (prefs.selectedApps.isEmpty()) {
             Toast.makeText(this, R.string.select_apps, Toast.LENGTH_SHORT).show()
+            binding.bottomNav.selectedItemId = R.id.nav_services
             return
         }
         try {
             VlessParser.parse(url)
         } catch (e: Exception) {
             Toast.makeText(this, e.message ?: "Некорректная ссылка", Toast.LENGTH_LONG).show()
+            binding.bottomNav.selectedItemId = R.id.nav_settings
             return
         }
         prefs.vlessUrl = url
+        binding.vlessInput.setText(url)
         LogStore.append("UI: starting boost…")
 
         val prepare = VpnService.prepare(this)
@@ -200,10 +320,18 @@ class MainActivity : AppCompatActivity() {
         binding.statusText.setTextColor(
             ContextCompat.getColor(this, if (running) R.color.ok else R.color.muted),
         )
-        binding.btnBoost.text = if (running) getString(R.string.boost_off) else getString(R.string.boost_on)
-        binding.btnBoost.setBackgroundColor(
-            ContextCompat.getColor(this, if (running) R.color.danger else R.color.accent),
-        )
+        binding.btnPower.setBackgroundResource(if (running) R.drawable.bg_power_on else R.drawable.bg_power)
+        binding.statusDot.setBackgroundResource(if (running) R.drawable.bg_power_on else R.drawable.bg_power)
+        if (running) {
+            if (sessionStartedAt == 0L) sessionStartedAt = System.currentTimeMillis()
+            handler.removeCallbacks(sessionTick)
+            handler.post(sessionTick)
+        } else {
+            sessionStartedAt = 0L
+            handler.removeCallbacks(sessionTick)
+            binding.sessionTime.text = "—"
+        }
+        refreshHomeMeta()
     }
 
     private fun checkUpdate() {
@@ -224,7 +352,7 @@ class MainActivity : AppCompatActivity() {
                         .setMessage(
                             "У вас: ${BuildConfig.VERSION_NAME} (code ${BuildConfig.VERSION_CODE})\n" +
                                 "Новая: ${update.versionName} (code ${update.versionCode})\n\n" +
-                                "Скачать и установить?",
+                                "Ссылка VPN сохранится после обновления.\nСкачать и установить?",
                         )
                         .setPositiveButton("Скачать") { _, _ ->
                             downloadApk(update.url, update.versionName)
@@ -251,6 +379,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun downloadApk(url: String, versionName: String) {
+        prefs.vlessUrl = binding.vlessInput.text?.toString().orEmpty()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
             Toast.makeText(this, "Разрешите установку из неизвестных источников", Toast.LENGTH_LONG).show()
             installPermission.launch(
@@ -268,6 +397,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun installApk(uri: Uri) {
+        prefs.vlessUrl = binding.vlessInput.text?.toString().orEmpty()
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, "application/vnd.android.package-archive")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -275,7 +405,6 @@ class MainActivity : AppCompatActivity() {
         try {
             startActivity(intent)
         } catch (e: Exception) {
-            // fallback через FileProvider если uri file://
             val path = uri.path
             if (path != null) {
                 val file = File(path)

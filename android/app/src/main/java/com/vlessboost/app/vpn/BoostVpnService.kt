@@ -48,37 +48,67 @@ import io.nekohasekai.libbox.SystemProxyStatus
 import io.nekohasekai.libbox.TunOptions
 import io.nekohasekai.libbox.WIFIState
 import io.nekohasekai.libbox.Notification as LibboxNotification
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
+class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler,
+    DefaultNetworkMonitor.UnderlyingNetworkSink {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var commandServer: CommandServer? = null
     private var commandClient: CommandClient? = null
     private var tunPfd: ParcelFileDescriptor? = null
+    private var startJob: Job? = null
     @Volatile
     private var starting = false
+    @Volatile
+    private var stopping = false
+
+    override fun onCreate() {
+        super.onCreate()
+        DefaultNetworkMonitor.setSink(this)
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
+                stopping = true
+                startJob?.cancel()
+                // FGS path may require a notification before tear-down on Android 8+.
+                runCatching {
+                    startForeground(NOTIFY_ID, buildNotification(getString(R.string.status_starting)))
+                }
                 stopBoost()
                 return START_NOT_STICKY
             }
         }
         startForeground(NOTIFY_ID, buildNotification(getString(R.string.status_starting)))
         if (starting || isRunning) return START_STICKY
+        stopping = false
         starting = true
-        scope.launch {
+        startJob = scope.launch {
             try {
                 startBoost()
+                ensureActive()
+                if (stopping || !isActive) {
+                    LogStore.append("start aborted after TUN (user stopped)")
+                    teardownTun()
+                    return@launch
+                }
                 broadcastStatus(true)
                 updateNotification(getString(R.string.status_on))
+            } catch (e: CancellationException) {
+                LogStore.append("start cancelled")
+                teardownTun()
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "start failed", e)
                 LogStore.append("ERROR: ${e.message}")
@@ -130,13 +160,54 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         }
         LogStore.append("calling startOrReloadService…")
         server.startOrReloadService(config, override)
+        ensureActive()
+        if (stopping) {
+            LogStore.append("stop requested during startOrReload — tearing down")
+            teardownTun()
+            runCatching { server.closeService() }
+            runCatching { server.close() }
+            commandServer = null
+            return@withContext
+        }
         LogStore.append("service started / reloaded (after openTun)")
         isRunning = true
         DefaultNetworkMonitor.setUpdatesEnabled(true)
+        // Re-apply live uplink in case network changed during start.
+        applyUnderlyingNetworks(DefaultNetworkMonitor.underlying)
         LogStore.append("post-start: underlying-only monitor (no Go iface push)")
         delay(300)
+        if (stopping) {
+            teardownTun()
+            return@withContext
+        }
         startLogClient()
         LogStore.append("post-start: log client done, still alive")
+    }
+
+    override fun onUnderlyingNetworkChanged(network: android.net.Network?) {
+        applyUnderlyingNetworks(network)
+    }
+
+    private fun applyUnderlyingNetworks(network: android.net.Network?) {
+        if (!isRunning && tunPfd == null) return
+        try {
+            if (network != null) {
+                setUnderlyingNetworks(arrayOf(network))
+                LogStore.append("live setUnderlyingNetworks applied")
+            } else {
+                setUnderlyingNetworks(null)
+                LogStore.append("live setUnderlyingNetworks cleared")
+            }
+        } catch (e: Exception) {
+            LogStore.append("live setUnderlyingNetworks error: ${e.message}")
+        }
+    }
+
+    private fun teardownTun() {
+        runCatching { setUnderlyingNetworks(null) }
+        runCatching { tunPfd?.close() }
+        tunPfd = null
+        isRunning = false
     }
 
     private fun startLogClient() {
@@ -196,17 +267,22 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
     private fun stopBoost() {
         LogStore.append("stopping…")
+        stopping = true
+        startJob?.cancel()
+        startJob = null
         stopLogClient()
         runCatching { commandServer?.closeService() }
         runCatching { commandServer?.close() }
         commandServer = null
-        runCatching { tunPfd?.close() }
-        tunPfd = null
+        teardownTun()
+        DefaultNetworkMonitor.setUpdatesEnabled(false)
         DefaultNetworkMonitor.stop()
         isRunning = false
+        starting = false
         broadcastStatus(false)
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
         stopSelf()
+        LogStore.append("stopped")
     }
 
     override fun onRevoke() {
@@ -214,8 +290,10 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     }
 
     override fun onDestroy() {
+        DefaultNetworkMonitor.setSink(null)
+        startJob?.cancel()
         scope.cancel()
-        if (isRunning) stopBoost()
+        if (isRunning || tunPfd != null) stopBoost()
         super.onDestroy()
     }
 
@@ -227,7 +305,10 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     override fun serviceReload() {
         scope.launch {
             try {
+                if (stopping) return@launch
                 startBoost()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "reload failed", e)
                 broadcastError(e.message ?: e.toString())
@@ -259,7 +340,12 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     // region PlatformInterface
     override fun openTun(options: TunOptions): Int {
         try {
+            if (stopping) error("start cancelled")
             if (prepare(this) != null) error("Нет разрешения VPN")
+
+            // Never leave an orphan TUN from a previous race.
+            runCatching { tunPfd?.close() }
+            tunPfd = null
 
             val builder = Builder()
                 .setSession("VLESS Boost")
@@ -400,7 +486,12 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             if (allowed.isEmpty()) error("Не выбрано ни одного приложения")
 
             LogStore.append("openTun establish… packages=${allowed.size}")
+            if (stopping) error("start cancelled before establish")
             val pfd = builder.establish() ?: error("Не удалось создать VPN-интерфейс")
+            if (stopping) {
+                runCatching { pfd.close() }
+                error("start cancelled after establish")
+            }
             tunPfd = pfd
             LogStore.append("TUN established fd=${pfd.fd} packages=${allowed.size}")
             return pfd.fd
@@ -671,7 +762,12 @@ class BoostVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
         fun stop(context: android.content.Context) {
             val i = Intent(context, BoostVpnService::class.java).setAction(ACTION_STOP)
-            context.startService(i)
+            try {
+                // Prefer FGS delivery so STOP reaches a service that was killed mid-start.
+                androidx.core.content.ContextCompat.startForegroundService(context, i)
+            } catch (_: Exception) {
+                context.startService(i)
+            }
         }
     }
 }
