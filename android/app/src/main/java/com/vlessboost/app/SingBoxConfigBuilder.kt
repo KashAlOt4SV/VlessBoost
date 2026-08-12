@@ -166,8 +166,7 @@ object SingBoxConfigBuilder {
                                 JSONObject()
                                     .put("type", "udp")
                                     .put("tag", "dns-direct")
-                                    .put("server", "8.8.8.8")
-                                    .put("detour", "direct"),
+                                    .put("server", "8.8.8.8"),
                             ),
                     )
                     .put(

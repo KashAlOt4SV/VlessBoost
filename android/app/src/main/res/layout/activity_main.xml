@@ -54,20 +54,20 @@
                 </LinearLayout>
 
                 <FrameLayout
-                    android:layout_width="140dp"
-                    android:layout_height="140dp"
+                    android:layout_width="168dp"
+                    android:layout_height="168dp"
                     android:layout_gravity="center_horizontal"
                     android:layout_marginTop="28dp">
 
-                    <TextView
+                    <ImageButton
                         android:id="@+id/btnPower"
                         android:layout_width="match_parent"
                         android:layout_height="match_parent"
-                        android:background="@drawable/bg_power"
-                        android:gravity="center"
-                        android:text="⏻"
-                        android:textColor="@android:color/white"
-                        android:textSize="48sp" />
+                        android:background="@android:color/transparent"
+                        android:contentDescription="@string/app_name"
+                        android:padding="8dp"
+                        android:scaleType="fitCenter"
+                        android:src="@drawable/ic_power_off" />
                 </FrameLayout>
 
                 <LinearLayout

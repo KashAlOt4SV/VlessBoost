@@ -320,7 +320,8 @@ class MainActivity : AppCompatActivity() {
         binding.statusText.setTextColor(
             ContextCompat.getColor(this, if (running) R.color.ok else R.color.muted),
         )
-        binding.btnPower.setBackgroundResource(if (running) R.drawable.bg_power_on else R.drawable.bg_power)
+        binding.btnPower.setImageResource(if (running) R.drawable.ic_power_on else R.drawable.ic_power_off)
+        binding.btnPower.isSelected = running
         binding.statusDot.setBackgroundResource(if (running) R.drawable.bg_power_on else R.drawable.bg_power)
         if (running) {
             if (sessionStartedAt == 0L) sessionStartedAt = System.currentTimeMillis()
