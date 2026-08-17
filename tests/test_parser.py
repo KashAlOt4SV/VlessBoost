@@ -22,6 +22,7 @@ def test_reality() -> None:
     out = endpoint_to_singbox_outbound(ep)
     assert out["type"] == "vless"
     assert out["tls"]["reality"]["enabled"] is True
+    assert out["packet_encoding"] == "xudp"
     print("reality: OK")
 
 

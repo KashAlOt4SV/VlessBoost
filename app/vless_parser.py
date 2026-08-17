@@ -106,13 +106,14 @@ def endpoint_to_singbox_outbound(endpoint: VlessEndpoint, tag: str = "proxy") ->
         "server": endpoint.server,
         "server_port": endpoint.port,
         "uuid": endpoint.uuid,
+        # Discord voice/Go Live and streams are UDP — xudp keeps them on one tunnel.
+        "packet_encoding": endpoint.packet_encoding or "xudp",
+        "tcp_keep_alive": "25s",
+        "connect_timeout": "8s",
+        "udp_fragment": True,
     }
     if endpoint.flow:
         outbound["flow"] = endpoint.flow
-    if endpoint.packet_encoding:
-        outbound["packet_encoding"] = endpoint.packet_encoding
-    elif endpoint.network in {"ws", "http", "grpc", "httpupgrade"}:
-        outbound["packet_encoding"] = "xudp"
 
     # TLS / Reality
     security = (endpoint.security or "none").lower()

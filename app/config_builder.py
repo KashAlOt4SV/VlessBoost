@@ -100,9 +100,9 @@ def build_singbox_config(settings: Settings) -> dict[str, Any]:
     if getattr(settings, "protect_direct", True):
         protect.extend(settings.protect_domains or [])
 
-    # Важно: sniff → DNS hijack → protect(direct) → proxy rules → final direct
+    # Sniff only long enough to classify TLS/HTTP/QUIC — long sniff delays Discord UDP.
     route_rules: list[dict[str, Any]] = [
-        {"action": "sniff"},
+        {"action": "sniff", "timeout": "200ms"},
         {"protocol": "dns", "action": "hijack-dns"},
         {"ip_is_private": True, "outbound": "direct"},
     ]
@@ -159,12 +159,14 @@ def build_singbox_config(settings: Settings) -> dict[str, Any]:
                 "tag": "tun-in",
                 "interface_name": settings.tun_interface or "vless-split",
                 "address": ["172.19.0.1/30"],
-                "mtu": 1500,
+                # 1500 + VLESS/TLS overhead fragments Discord voice/Go Live UDP.
+                "mtu": 1400,
                 "auto_route": True,
                 # strict_route=true часто ломает обычный (direct) трафик на Windows
                 "strict_route": False,
                 "stack": "mixed",
                 "endpoint_independent_nat": True,
+                "udp_timeout": "5m",
             },
             {
                 "type": "mixed",
@@ -182,6 +184,7 @@ def build_singbox_config(settings: Settings) -> dict[str, Any]:
         ],
         "route": {
             "auto_detect_interface": True,
+            "default_domain_resolver": "dns-direct",
             "rules": route_rules,
             "final": "direct",
         },

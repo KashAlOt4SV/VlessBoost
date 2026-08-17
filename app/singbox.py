@@ -247,7 +247,7 @@ class SingBoxManager:
             cwd=str(BIN_DIR),
             creationflags=_create_no_window(),
         )
-        time.sleep(0.8)
+        time.sleep(1.2)
         if self._proc.poll() is not None:
             raise RuntimeError(
                 f"sing-box сразу завершился (код {self._proc.returncode}). "

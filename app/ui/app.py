@@ -67,6 +67,8 @@ class BoosterApp(ctk.CTk):
         self._last_win_size: tuple[int, int] | None = None
         self._resize_shield_on = False
         self._ui_frozen = False
+        self._expect_running = False
+        self._watch_after: str | None = None
 
         trim_log_file()
 
@@ -1201,30 +1203,31 @@ class BoosterApp(ctk.CTk):
 
         if not self._session_started_at:
             return "—"
-        elapsed = max(0, int(time.time() - self._session_started_at))
-        h, rem = divmod(elapsed, 3600)
-        m, s = divmod(rem, 60)
+        elapsed = max(0, int(time.monotonic() - self._session_started_at))
+        h, rel = divmod(elapsed, 3600)
+        m, s = divmod(rel, 60)
         return f"{h:02d}:{m:02d}:{s:02d}"
 
     def _tick_session(self) -> None:
         self._session_after = None
         if not self.manager.running:
+            if self._expect_running:
+                self._on_singbox_died()
             return
-        if self._ui_frozen or self._resize_shield_on:
-            self._session_after = self.after(1000, self._tick_session)
-            return
+        # Always refresh time — modal/resize must not freeze the counter.
         text = self._session_text()
-        if hasattr(self, "side_session_lbl"):
-            self.side_session_lbl.configure(text=f"Сессия: {text}")
-        if hasattr(self, "stat_session"):
-            self.stat_session._value_lbl.configure(text=text)  # type: ignore[attr-defined]
+        if not (self._ui_frozen or self._resize_shield_on):
+            if hasattr(self, "side_session_lbl"):
+                self.side_session_lbl.configure(text=f"Сессия: {text}")
+            if hasattr(self, "stat_session"):
+                self.stat_session._value_lbl.configure(text=text)  # type: ignore[attr-defined]
         self._session_after = self.after(1000, self._tick_session)
 
     def _start_session_timer(self) -> None:
         import time
 
         if self._session_started_at is None:
-            self._session_started_at = time.time()
+            self._session_started_at = time.monotonic()
         if self._session_after is None:
             self._tick_session()
 
@@ -1728,24 +1731,7 @@ class BoosterApp(ctk.CTk):
                 relaunch_as_admin()
             return
 
-        # Зависший sing-box с прошлого запуска
-        try:
-            external = self.manager.external_instances()
-        except Exception:
-            external = []
-        if external and not self.manager.running:
-            pids = ", ".join(str(p) for p, _ in external)
-            if not messagebox.askyesno(
-                "Активное соединение",
-                "Найден работающий sing-box от прошлого запуска.\n"
-                f"PID: {pids}\n\n"
-                "Убить его и подключиться заново?",
-                parent=self,
-            ):
-                return
-            # start() тоже убьёт, но сделаем явно до busy
-            self.manager.kill_external()
-
+        # Зависший sing-box убивается внутри start() — не блокируем GUI PowerShell-сканом.
         self._busy = True
         self.boost_btn.configure(text="…", state="disabled")
         if hasattr(self, "home_title_lbl"):
@@ -1768,24 +1754,65 @@ class BoosterApp(ctk.CTk):
         self._busy = False
         self._stop_connect_animation()
         self.boost_btn.configure(state="normal")
-        self._refresh_status()
         if ok:
-            messagebox.showinfo(
-                "Готово",
-                msg + "\nЕсли программа уже была открыта — перезапустите её.",
-                parent=self,
-            )
-            # Автопинг после успешного старта
+            self._expect_running = True
+            self._start_singbox_watch()
+            self._refresh_status()
+            try:
+                self.footer_lbl.configure(text=msg)
+            except Exception:
+                pass
             self.after(200, self._ping_server)
         else:
+            self._expect_running = False
+            self._refresh_status()
             messagebox.showerror("Не удалось включить", msg, parent=self)
 
     def _stop(self) -> None:
+        self._expect_running = False
+        self._stop_singbox_watch()
         try:
             self.manager.stop()
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc), parent=self)
         self._refresh_status()
+
+    def _start_singbox_watch(self) -> None:
+        self._stop_singbox_watch()
+        self._watch_after = self.after(2000, self._watch_singbox)
+
+    def _stop_singbox_watch(self) -> None:
+        if self._watch_after is not None:
+            try:
+                self.after_cancel(self._watch_after)
+            except Exception:
+                pass
+            self._watch_after = None
+
+    def _watch_singbox(self) -> None:
+        self._watch_after = None
+        if not self._expect_running:
+            return
+        if not self.manager.running:
+            self._on_singbox_died()
+            return
+        if self._session_after is None and self.manager.running:
+            self._tick_session()
+        self._watch_after = self.after(2000, self._watch_singbox)
+
+    def _on_singbox_died(self) -> None:
+        if not self._expect_running:
+            return
+        self._expect_running = False
+        self._stop_singbox_watch()
+        logger.warning("sing-box exited while session was expected to stay up")
+        self._refresh_status()
+        try:
+            self.footer_lbl.configure(
+                text="Соединение оборвалось (sing-box остановился). Включите ускорение снова."
+            )
+        except Exception:
+            pass
 
     def _stop_status_blink(self) -> None:
         if self._status_blink_after is not None:
