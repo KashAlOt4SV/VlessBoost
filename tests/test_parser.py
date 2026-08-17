@@ -23,6 +23,8 @@ def test_reality() -> None:
     assert out["type"] == "vless"
     assert out["tls"]["reality"]["enabled"] is True
     assert out["packet_encoding"] == "xudp"
+    assert "tcp_keep_alive" not in out
+    assert out["connect_timeout"] == "8s"
     print("reality: OK")
 
 

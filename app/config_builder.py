@@ -184,7 +184,6 @@ def build_singbox_config(settings: Settings) -> dict[str, Any]:
         ],
         "route": {
             "auto_detect_interface": True,
-            "default_domain_resolver": "dns-direct",
             "rules": route_rules,
             "final": "direct",
         },
