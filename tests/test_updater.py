@@ -20,7 +20,13 @@ def test_apply_bat_has_no_findstr() -> None:
         assert "findstr" not in text
         assert "tasklist" not in text
         assert "goto wait" in text
-        assert "create_no_window" not in text
+        assert "wscript.exe" in text
+        assert 'start "" "%dst%"' not in text
+        vbs = tmp / "relaunch.vbs"
+        assert vbs.is_file()
+        vbs_text = vbs.read_text(encoding="ascii")
+        assert "WScript.Shell" in vbs_text
+        assert str(dst) in vbs_text
         print("apply-bat: OK")
 
 

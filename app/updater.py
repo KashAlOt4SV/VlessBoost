@@ -198,6 +198,34 @@ def download_update_to_temp(url: str, version: str) -> Path:
     return stage_update_exe(downloaded, version)
 
 
+def _vbs_escape(path: str) -> str:
+    return path.replace('"', '""')
+
+
+def _write_relaunch_vbs(*, exe: Path, workdir: Path) -> Path:
+    """Launch like Explorer: correct cwd, breaks away from the hidden updater cmd.
+
+    `start "" exe` from CREATE_NO_WINDOW cmd leaves a onefile PyInstaller extract
+    half-finished (_MEI*\\python312.dll missing). Double-click from the folder works.
+    """
+    vbs = UPDATES_DIR / "relaunch.vbs"
+    exe_s = _vbs_escape(str(exe))
+    dir_s = _vbs_escape(str(workdir))
+    vbs.write_text(
+        "\r\n".join(
+            [
+                'Set sh = CreateObject("WScript.Shell")',
+                f'sh.CurrentDirectory = "{dir_s}"',
+                f'sh.Run """{exe_s}""", 1, False',
+                "",
+            ]
+        ),
+        encoding="ascii",
+        errors="replace",
+    )
+    return vbs
+
+
 def _write_apply_bat(*, src: Path, dst: Path, wait_pid: int) -> Path:
     """Bat that waits until the install exe is unlocked, then replaces it.
 
@@ -207,19 +235,24 @@ def _write_apply_bat(*, src: Path, dst: Path, wait_pid: int) -> Path:
     UPDATES_DIR.mkdir(parents=True, exist_ok=True)
     src_s = str(src)
     dst_s = str(dst)
+    inst_s = str(dst.parent)
     old_s = str(dst) + ".old"
     pending_s = str(PENDING_PATH)
     lock_s = str(UPDATES_DIR / "apply.lock")
     log_s = str(UPDATES_DIR / "apply.log")
+    vbs = _write_relaunch_vbs(exe=dst, workdir=dst.parent)
+    vbs_s = str(vbs)
     lines = [
         "@echo off",
         "setlocal EnableExtensions",
         f'set "SRC={src_s}"',
         f'set "DST={dst_s}"',
+        f'set "INSTDIR={inst_s}"',
         f'set "OLD={old_s}"',
         f'set "PENDING={pending_s}"',
         f'set "LOCK={lock_s}"',
         f'set "LOG={log_s}"',
+        f'set "VBS={vbs_s}"',
         f'echo apply start pid={int(wait_pid)} %DATE% %TIME%>>"%LOG%"',
         'echo %RANDOM%>"%LOCK%"',
         "set N=0",
@@ -239,7 +272,15 @@ def _write_apply_bat(*, src: Path, dst: Path, wait_pid: int) -> Path:
         'del /f /q "%PENDING%" >nul 2>&1',
         'del /f /q "%LOCK%" >nul 2>&1',
         'echo ok>>"%LOG%"',
-        'start "" "%DST%"',
+        "ping 127.0.0.1 -n 4 >nul",
+        'cd /d "%INSTDIR%"',
+        'wscript.exe //nologo "%VBS%"',
+        "if errorlevel 1 (",
+        '  echo wscript failed, start fallback>>"%LOG%"',
+        '  start "" /D "%INSTDIR%" "%DST%"',
+        ")",
+        "ping 127.0.0.1 -n 2 >nul",
+        'del /f /q "%VBS%" >nul 2>&1',
         'del /f /q "%~f0" >nul 2>&1',
         "endlocal",
         "exit /b 0",
@@ -251,6 +292,7 @@ def _write_apply_bat(*, src: Path, dst: Path, wait_pid: int) -> Path:
 
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
 
 def abort_stuck_apply_scripts() -> None:
@@ -351,7 +393,7 @@ def _spawn_detached_bat(bat: Path) -> None:
     creation = 0
     startup = None
     if sys.platform == "win32":
-        creation = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        creation = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
         startup = subprocess.STARTUPINFO()
         startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startup.wShowWindow = 0
