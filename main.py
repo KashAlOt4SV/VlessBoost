@@ -58,8 +58,9 @@ def main() -> int:
     log.info("VLESS Boost starting")
 
     try:
-        from app.updater import apply_pending_update_on_startup
+        from app.updater import abort_stuck_apply_scripts, apply_pending_update_on_startup
 
+        abort_stuck_apply_scripts()
         if apply_pending_update_on_startup():
             log.info("Exiting to apply pending OTA update")
             return 0

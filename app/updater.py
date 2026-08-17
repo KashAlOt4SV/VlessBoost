@@ -199,14 +199,17 @@ def download_update_to_temp(url: str, version: str) -> Path:
 
 
 def _write_apply_bat(*, src: Path, dst: Path, wait_pid: int) -> Path:
-    """Bat that waits for our PID to exit, replaces install exe, relaunches."""
+    """Bat that waits until the install exe is unlocked, then replaces it.
+
+    Must NOT use tasklist/findstr: those spawn visible consoles and can loop forever.
+    """
     bat = UPDATES_DIR / "apply-update.bat"
     UPDATES_DIR.mkdir(parents=True, exist_ok=True)
-    # Use ASCII-only paths in bat; quote carefully for cmd.
     src_s = str(src)
     dst_s = str(dst)
     old_s = str(dst) + ".old"
     pending_s = str(PENDING_PATH)
+    lock_s = str(UPDATES_DIR / "apply.lock")
     log_s = str(UPDATES_DIR / "apply.log")
     lines = [
         "@echo off",
@@ -215,26 +218,26 @@ def _write_apply_bat(*, src: Path, dst: Path, wait_pid: int) -> Path:
         f'set "DST={dst_s}"',
         f'set "OLD={old_s}"',
         f'set "PENDING={pending_s}"',
+        f'set "LOCK={lock_s}"',
         f'set "LOG={log_s}"',
-        f"set PID={int(wait_pid)}",
-        'echo apply start %DATE% %TIME%>>"%LOG%"',
+        f'echo apply start pid={int(wait_pid)} %DATE% %TIME%>>"%LOG%"',
+        'echo %RANDOM%>"%LOCK%"',
+        "set N=0",
         ":wait",
-        'tasklist /FI "PID eq %PID%" 2>nul | findstr /C:"%PID%" >nul',
-        "if not errorlevel 1 (",
-        "  ping 127.0.0.1 -n 2 >nul",
-        "  goto wait",
+        "set /a N+=1",
+        "if %N% GTR 90 (",
+        '  echo wait timeout>>"%LOG%"',
+        '  del /f /q "%LOCK%" >nul 2>&1',
+        "  exit /b 1",
         ")",
         "ping 127.0.0.1 -n 2 >nul",
         'if exist "%OLD%" del /f /q "%OLD%" >nul 2>&1',
-        'if exist "%DST%" move /y "%DST%" "%OLD%" >nul 2>&1',
+        'if exist "%DST%" del /f /q "%DST%" >nul 2>&1',
         'copy /y "%SRC%" "%DST%" >nul',
-        "if errorlevel 1 (",
-        '  echo copy failed>>"%LOG%"',
-        '  if exist "%OLD%" move /y "%OLD%" "%DST%" >nul 2>&1',
-        "  exit /b 1",
-        ")",
+        "if errorlevel 1 goto wait",
         'del /f /q "%OLD%" >nul 2>&1',
         'del /f /q "%PENDING%" >nul 2>&1',
+        'del /f /q "%LOCK%" >nul 2>&1',
         'echo ok>>"%LOG%"',
         'start "" "%DST%"',
         'del /f /q "%~f0" >nul 2>&1',
@@ -246,20 +249,121 @@ def _write_apply_bat(*, src: Path, dst: Path, wait_pid: int) -> Path:
     return bat
 
 
+CREATE_NO_WINDOW = 0x08000000
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+
+def abort_stuck_apply_scripts() -> None:
+    """Kill leftover apply-update.bat / findstr wait loops from older builds.
+
+    Elevated updater processes often have an empty WMI CommandLine, so also match
+    findstr by window title and stop its parent cmd first (otherwise the bat
+    proceeds to copy/relaunch after findstr dies).
+    """
+    if sys.platform != "win32":
+        return
+    lock = UPDATES_DIR / "apply.lock"
+    bat = UPDATES_DIR / "apply-update.bat"
+    try:
+        listed = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq findstr.exe", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        has_findstr = "findstr" in (listed.stdout or "").lower()
+    except Exception:
+        has_findstr = True
+    if not has_findstr and not bat.exists() and not PENDING_PATH.exists() and not lock.exists():
+        return
+    script = (
+        "$ids = @(); "
+        "Get-CimInstance Win32_Process | ForEach-Object { "
+        "  $cl = $_.CommandLine; "
+        "  if ($cl -and $_.Name -eq 'cmd.exe' -and $cl -match 'apply-update\\.bat') { $ids += $_.ProcessId }; "
+        "  if ($cl -and $_.Name -eq 'findstr.exe' -and $cl -match '/C:\"\\d+\"') { "
+        "    $ids += $_.ParentProcessId; $ids += $_.ProcessId "
+        "  } "
+        "}; "
+        "Get-Process -Name findstr -ErrorAction SilentlyContinue | Where-Object { "
+        "  $_.MainWindowTitle -match 'findstr\\s+/C:\"\\d+\"' "
+        "} | ForEach-Object { "
+        "  $wmi = Get-CimInstance Win32_Process -Filter (\"ProcessId={0}\" -f $_.Id) -ErrorAction SilentlyContinue; "
+        "  if ($wmi) { $ids += $wmi.ParentProcessId }; "
+        "  $ids += $_.Id "
+        "}; "
+        "$ids | Where-Object { $_ -gt 0 } | Select-Object -Unique | ForEach-Object { "
+        "  Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue "
+        "}"
+    )
+    try:
+        subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                script,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            creationflags=CREATE_NO_WINDOW,
+            shell=False,
+        )
+    except Exception:
+        logger.warning("could not abort stuck updater processes", exc_info=True)
+    try:
+        if lock.exists():
+            lock.unlink()
+    except OSError:
+        pass
+    if not PENDING_PATH.exists():
+        try:
+            if bat.exists():
+                bat.unlink()
+        except OSError:
+            pass
+
+
 def _spawn_detached_bat(bat: Path) -> None:
-    """Launch updater bat so it survives parent process exit."""
+    """Launch updater bat hidden so it survives parent exit without consoles."""
+    lock = UPDATES_DIR / "apply.lock"
+    if lock.exists():
+        age = time.time() - lock.stat().st_mtime
+        if age < 180:
+            logger.info("apply.lock present (%.0fs) — skip second updater", age)
+            return
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+    try:
+        lock.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+
     creation = 0
+    startup = None
     if sys.platform == "win32":
-        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — don't die with parent
-        creation = 0x00000008 | 0x00000200
+        creation = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = 0
     subprocess.Popen(
-        ["cmd.exe", "/c", str(bat)],
+        ["cmd.exe", "/d", "/c", str(bat)],
         cwd=str(bat.parent),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         close_fds=True,
         creationflags=creation,
+        startupinfo=startup,
         shell=False,
     )
 
