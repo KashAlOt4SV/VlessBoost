@@ -5,7 +5,6 @@ from copy import deepcopy
 import json
 import logging
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -17,6 +16,7 @@ from pathlib import Path
 from app.config_builder import write_singbox_config
 from app.paths import BIN_DIR, LOG_PATH, SINGBOX_CONFIG_PATH, SINGBOX_EXE
 from app.settings import Settings
+from app.startup_check import CoreOutput, wait_for_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +152,7 @@ class SingBoxManager:
     def __init__(self) -> None:
         self._proc: subprocess.Popen[str] | None = None
         self.active_settings: Settings | None = None
+        self._output: CoreOutput | None = None
         BIN_DIR.mkdir(parents=True, exist_ok=True)
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -216,6 +217,7 @@ class SingBoxManager:
             )
 
         self.ensure_binary()
+        logger.info("Starting core: tun=%s local_port=%s", settings.tun_interface, settings.socks_port)
         write_singbox_config(settings)
 
         check = subprocess.run(
@@ -234,47 +236,51 @@ class SingBoxManager:
         if kill_external and self.has_external_instance():
             self.kill_external()
 
-        log_fh = LOG_PATH.open("a", encoding="utf-8")
-        log_fh.write(f"\n--- start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-        log_fh.flush()
-
+        logger.info('--- core start ---')
+        self._proc = subprocess.Popen(
+            [str(SINGBOX_EXE), 'run', '-c', str(SINGBOX_CONFIG_PATH)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace', bufsize=1,
+            cwd=str(BIN_DIR), creationflags=_create_no_window(),
+        )
+        self._output = CoreOutput(self._proc.stdout)
+        self._output.start()
         try:
-            self._proc = subprocess.Popen(
-                [str(SINGBOX_EXE), "run", "-c", str(SINGBOX_CONFIG_PATH)],
-                stdout=log_fh, stderr=subprocess.STDOUT, cwd=str(BIN_DIR),
-                creationflags=_create_no_window(),
-            )
-        finally:
-            log_fh.close()  # child owns its inherited handle
-        try:
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline:
-                if self._proc.poll() is not None:
-                    raise RuntimeError(f"sing-box exited ({self._proc.returncode}). Log: {LOG_PATH}")
-                try:
-                    with socket.create_connection(("127.0.0.1", settings.socks_port), timeout=0.25) as sock:
-                        sock.sendall(b"\x05\x01\x00")
-                        response = b""
-                        while len(response) < 2:
-                            part = sock.recv(2 - len(response))
-                            if not part:
-                                break
-                            response += part
-                        if response == b"\x05\x00":
-                            break
-                except OSError:
-                    pass
-                try:
-                    self._proc.wait(timeout=0.1)
-                except subprocess.TimeoutExpired:
-                    pass
-            else:
-                raise RuntimeError("sing-box did not open the local proxy within 10 seconds")
-        except Exception:
-            self.stop()
-            raise
+            wait_for_proxy(self._proc, settings.socks_port)
+        except Exception as exc:
+            logger.exception('Core did not become ready')
+            output = self._output
+            self.stop()  # Drain final core messages before reporting the failure.
+            detail = output.summary() if output else ''
+            self._log_adapter_state()
+            message = str(exc)
+            if detail:
+                message += '\n\nПоследние сообщения ядра:\n' + detail
+            message += '\n\nПолный журнал доступен во вкладке «Логи».'
+            raise RuntimeError(message) from exc
         self.active_settings = deepcopy(settings)
         logger.info("sing-box запущен, pid=%s", self._proc.pid)
+
+    def _log_adapter_state(self) -> None:
+        """Read-only evidence for driver/startup failures; never resets adapters."""
+        command = (
+            "Get-CimInstance Win32_NetworkAdapter | "
+            "Where-Object { $_.Name -match 'Wintun|sing-tun' -or $_.ServiceName -match 'wintun' } | "
+            "Select-Object Name,NetEnabled,NetConnectionStatus,ConfigManagerErrorCode | "
+            "ConvertTo-Json -Compress"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True, text=True, timeout=8,
+                creationflags=_create_no_window(),
+            )
+            if result.returncode == 0:
+                logger.warning("TUN adapter snapshot: %s", (result.stdout or "").strip() or "no matching adapters")
+            else:
+                logger.warning("Adapter query failed: code=%s", result.returncode)
+        except Exception as exc:
+            logger.warning("Adapter query unavailable: %s", exc)
 
     def stop(self) -> None:
         if self._proc:
@@ -286,6 +292,9 @@ class SingBoxManager:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=3)
+            if self._output is not None:
+                self._output.finish()
+                self._output = None
             self._proc = None
             self.active_settings = None
             logger.info("sing-box остановлен")

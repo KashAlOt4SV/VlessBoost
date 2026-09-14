@@ -22,7 +22,7 @@ class RegressionTests(unittest.TestCase):
    self.assertEqual(list_our_singbox_processes(),[(3,str(SINGBOX_EXE))])
  def test_stop_never_scans_or_kills_unmanaged(self):
   manager=SingBoxManager.__new__(SingBoxManager); manager.external_instances=MagicMock(side_effect=AssertionError('scan'))
-  proc=MagicMock(); proc.poll.return_value=None; manager._proc=proc
+  proc=MagicMock(); proc.poll.return_value=None; manager._proc=proc; manager._output=None
   manager.stop(); proc.terminate.assert_called_once(); proc.wait.assert_called_once(); self.assertIsNone(manager._proc)
  def test_fragmented_socks_response(self):
   sock=MagicMock(); sock.recv.side_effect=[b'\x05',b'\x00']

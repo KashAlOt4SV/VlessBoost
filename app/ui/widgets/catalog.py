@@ -1,7 +1,10 @@
 """Viewport-rendered service catalog; no per-service native window hierarchy."""
 import math
+import time
 import tkinter as tk
 import customtkinter as ctk
+from PIL import ImageTk
+from app.ui.widgets.rocker import render_rocker
 from app.presets import CATEGORY_LABELS
 from app.ui.theme import COLORS, FONT_UI
 from app.ui.widgets.scrolling import StableScrollbar
@@ -34,11 +37,17 @@ class CatalogView(ctk.CTkFrame):
         self.columns = 2
         self.icons = {}
         self._photos = {}
+        self._toggle_photos = {}
+        self._toggle_nodes = {}
+        self._transitions = {}
+        self._animation_job = None
         self._pending = None
         self._signature = None
         self._hover = None
         self._focus = 0
         self._hits = []
+        self.bind('<Unmap>', self._finish_animations, add='+')
+        self.bind('<Map>', lambda e: self.invalidate(), add='+')
         self.canvas.bind('<Configure>', lambda e: self.invalidate())
         self.canvas.bind('<MouseWheel>', self._wheel)
         self.canvas.bind('<Button-1>', self._click)
@@ -106,7 +115,12 @@ class CatalogView(ctk.CTkFrame):
                 break
 
     def _toggle(self, item):
+        key = item.preset.id
+        current = self._toggle_progress(key, item.enabled)
         item.enabled = not item.enabled
+        self._transitions[key] = (time.perf_counter(), current, float(item.enabled))
+        if self._animation_job is None:
+            self._animation_job = self.after(16, self._animate_toggles)
         self.invalidate()
         self.on_toggle(item.preset.id, item.enabled)
 
@@ -150,6 +164,7 @@ class CatalogView(ctk.CTkFrame):
             return
         self._signature = sig
         self.canvas.delete('all')
+        self._toggle_nodes.clear()
         self._hits = []
         cellw = w / self.columns
         start = max(0, int(top // rowh) * self.columns)
@@ -176,26 +191,67 @@ class CatalogView(ctk.CTkFrame):
             if self.mode=='cards':
                 self.canvas.create_text(titlex,y+43*scale,text=CATEGORY_LABELS.get(p.category,p.category),anchor='nw',
                                         font=(FONT_UI,-round(11*scale)),fill=COLORS['muted'])
-                tx,ty,tw=x+16*scale,y+78*scale,right-x-32*scale
+                tx,ty,tw=x+16*scale,y+78*scale,right-x-82*scale
             else:
                 tx,ty,tw=titlex,y+40*scale,textwidth
             self.canvas.create_text(tx,ty,text=p.description,anchor='nw',width=tw,
                                     font=(FONT_UI,-round(12*scale)),fill=COLORS['muted'])
-            sx,sy=right-58*scale,y+24*scale
-            self._rounded(sx,sy,sx+42*scale,sy+22*scale,11*scale,COLORS['primary'] if active else '#243044')
-            cx=sx+(31 if active else 11)*scale
-            self.canvas.create_oval(cx-8*scale,sy+3*scale,cx+8*scale,sy+19*scale,fill='white',outline='')
+            node = self.canvas.create_image(right-16*scale, (y+bottom)/2,
+                image=self._toggle_image(self._toggle_progress(p.id, active), scale), anchor='e')
+            self._toggle_nodes[p.id] = node
             self._hits.append((x,y,right,bottom,item))
         if not self.visible:
             self.canvas.create_text(w/2,40*scale,text='Сервисы не найдены',fill=COLORS['muted'],font=(FONT_UI,14))
+
+    def _toggle_progress(self, key, enabled):
+        transition = self._transitions.get(key)
+        if transition is None:
+            return float(enabled)
+        start, origin, target = transition
+        t = min(1.0, (time.perf_counter() - start) / 0.22)
+        eased = t * t * (3 - 2 * t)
+        return origin + (target - origin) * eased
+
+    def _toggle_image(self, progress, scale):
+        key = (scale, self.mode)
+        if key not in self._toggle_photos:
+            width, height = (32, 66) if self.mode == 'cards' else (26, 54)
+            size = (max(1, round(width*scale)), max(1, round(height*scale)))
+            frames = [ImageTk.PhotoImage(render_rocker(size, index/16), master=self.canvas)
+                      for index in range(17)]
+            self._toggle_photos[key] = frames
+        return self._toggle_photos[key][max(0, min(16, round(progress*16)))]
+
+    def _animate_toggles(self):
+        self._animation_job = None
+        now = time.perf_counter()
+        scale = self._get_widget_scaling()
+        for key, (start, origin, target) in list(self._transitions.items()):
+            node = self._toggle_nodes.get(key)
+            if node is not None:
+                self.canvas.itemconfigure(node, image=self._toggle_image(
+                    self._toggle_progress(key, bool(target)), scale))
+            if now - start >= 0.22:
+                self._transitions.pop(key, None)
+        if self._transitions:
+            self._animation_job = self.after(16, self._animate_toggles)
+
+    def _finish_animations(self, event=None):
+        if self._animation_job is not None:
+            self.after_cancel(self._animation_job)
+            self._animation_job = None
+        self._transitions.clear()
+        self._signature = None
 
     def _set_scaling(self, *args):
         super()._set_scaling(*args)
         if hasattr(self, '_photos'):
             self._photos.clear()
+            self._toggle_photos.clear()
             self.invalidate()
 
     def destroy(self):
+        self._finish_animations()
         if self._pending is not None:
             self.after_cancel(self._pending)
         super().destroy()

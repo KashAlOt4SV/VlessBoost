@@ -779,7 +779,8 @@ class BoosterApp(ctk.CTk):
         save_settings(self.settings)
         self._home_services_sig = None
         self._update_summary()
-        self._refresh_home_services()
+        if self._current_page == "home":
+            self._refresh_home_services()
 
     def _update_summary(self) -> None:
         import copy
