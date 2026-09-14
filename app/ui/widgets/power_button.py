@@ -48,7 +48,10 @@ class PowerButton(ctk.CTkFrame):
         self._connecting = connecting
         if glow is not None:
             self._glow = glow
-        self.label.configure(image=self._image(on=on or connecting))
+        image = self._image(on=on or connecting)
+        if image is not getattr(self, "_displayed_image", None):
+            self._displayed_image = image
+            self.label.configure(image=image)
 
     def refresh(self) -> None:
         self.set_state(on=self._on, connecting=self._connecting, glow=self._glow)

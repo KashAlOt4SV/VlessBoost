@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ctypes
+from copy import deepcopy
 import json
 import logging
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -112,23 +114,16 @@ def list_singbox_processes(*, force: bool = False) -> list[tuple[int, str]]:
 def list_our_singbox_processes(*, force: bool = False) -> list[tuple[int, str]]:
     """sing-box из нашей папки bin/ (или без пути — считаем своим)."""
     our = SINGBOX_EXE.resolve()
-    found: list[tuple[int, str]] = []
+    found = []
     for pid, path in list_singbox_processes(force=force):
+        # Unknown paths and other VPN clients are never ours to terminate.
         if not path:
-            found.append((pid, path))
             continue
         try:
-            p = Path(path).resolve()
-        except Exception:
-            found.append((pid, path))
+            if Path(path).resolve() == our:
+                found.append((pid, path))
+        except OSError:
             continue
-        if p == our:
-            found.append((pid, path))
-            continue
-        # dist/bin рядом с exe и путь с именем проекта
-        low = str(p).lower()
-        if low.endswith("sing-box.exe") and ("vless" in low or "\\bin\\" in low or "/bin/" in low):
-            found.append((pid, path))
     return found
 
 
@@ -138,17 +133,17 @@ def kill_pids(pids: list[int]) -> list[int]:
     killed: list[int] = []
     for pid in pids:
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["taskkill", "/F", "/PID", str(pid)],
                 capture_output=True,
                 text=True,
                 timeout=10,
                 creationflags=_create_no_window(),
             )
-            killed.append(pid)
+            if result.returncode == 0:
+                killed.append(pid)
         except Exception as exc:
             logger.warning("taskkill %s failed: %s", pid, exc)
-    time.sleep(0.4)
     _PROCESS_CACHE = None
     return killed
 
@@ -156,6 +151,7 @@ def kill_pids(pids: list[int]) -> list[int]:
 class SingBoxManager:
     def __init__(self) -> None:
         self._proc: subprocess.Popen[str] | None = None
+        self.active_settings: Settings | None = None
         BIN_DIR.mkdir(parents=True, exist_ok=True)
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -213,8 +209,6 @@ class SingBoxManager:
     def start(self, settings: Settings, *, kill_external: bool = True) -> None:
         if self.running:
             return
-        if kill_external and self.has_external_instance():
-            self.kill_external()
         if not is_admin():
             raise PermissionError(
                 "Для TUN-режима нужны права администратора. "
@@ -229,6 +223,7 @@ class SingBoxManager:
             capture_output=True,
             text=True,
             creationflags=_create_no_window(),
+            timeout=20,
         )
         if check.returncode != 0:
             raise RuntimeError(
@@ -236,29 +231,54 @@ class SingBoxManager:
                 + (check.stderr or check.stdout or "unknown error")
             )
 
+        if kill_external and self.has_external_instance():
+            self.kill_external()
+
         log_fh = LOG_PATH.open("a", encoding="utf-8")
         log_fh.write(f"\n--- start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
         log_fh.flush()
 
-        self._proc = subprocess.Popen(
-            [str(SINGBOX_EXE), "run", "-c", str(SINGBOX_CONFIG_PATH)],
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            cwd=str(BIN_DIR),
-            creationflags=_create_no_window(),
-        )
-        time.sleep(1.2)
-        if self._proc.poll() is not None:
-            raise RuntimeError(
-                f"sing-box сразу завершился (код {self._proc.returncode}). "
-                f"Смотрите лог: {LOG_PATH}"
+        try:
+            self._proc = subprocess.Popen(
+                [str(SINGBOX_EXE), "run", "-c", str(SINGBOX_CONFIG_PATH)],
+                stdout=log_fh, stderr=subprocess.STDOUT, cwd=str(BIN_DIR),
+                creationflags=_create_no_window(),
             )
+        finally:
+            log_fh.close()  # child owns its inherited handle
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if self._proc.poll() is not None:
+                    raise RuntimeError(f"sing-box exited ({self._proc.returncode}). Log: {LOG_PATH}")
+                try:
+                    with socket.create_connection(("127.0.0.1", settings.socks_port), timeout=0.25) as sock:
+                        sock.sendall(b"\x05\x01\x00")
+                        response = b""
+                        while len(response) < 2:
+                            part = sock.recv(2 - len(response))
+                            if not part:
+                                break
+                            response += part
+                        if response == b"\x05\x00":
+                            break
+                except OSError:
+                    pass
+                try:
+                    self._proc.wait(timeout=0.1)
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                raise RuntimeError("sing-box did not open the local proxy within 10 seconds")
+        except Exception:
+            self.stop()
+            raise
+        self.active_settings = deepcopy(settings)
         logger.info("sing-box запущен, pid=%s", self._proc.pid)
 
     def stop(self) -> None:
         if self._proc:
             proc = self._proc
-            self._proc = None
             if proc.poll() is None:
                 proc.terminate()
                 try:
@@ -266,9 +286,9 @@ class SingBoxManager:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=3)
+            self._proc = None
+            self.active_settings = None
             logger.info("sing-box остановлен")
-        if self.has_external_instance():
-            self.kill_external()
 
     def status_text(self) -> str:
         if self.running and self._proc:

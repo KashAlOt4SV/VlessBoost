@@ -106,7 +106,7 @@ def endpoint_to_singbox_outbound(endpoint: VlessEndpoint, tag: str = "proxy") ->
         "server": endpoint.server,
         "server_port": endpoint.port,
         "uuid": endpoint.uuid,
-        # Discord voice/Go Live and streams are UDP — xudp keeps them on one tunnel.
+        # Preserve explicit packet encoding; xudp carries UDP over VLESS.
         # tcp_keep_alive is sing-box 1.13+; Windows bundles 1.11.15.
         "packet_encoding": endpoint.packet_encoding or "xudp",
         "connect_timeout": "8s",

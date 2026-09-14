@@ -4,6 +4,8 @@ import logging
 import math
 import sys
 import threading
+import queue
+import time
 
 import customtkinter as ctk
 import pystray
@@ -26,7 +28,9 @@ from app.ui.helpers import (
 )
 from app.ui.perf import perf
 from app.ui.theme import COLORS, FONT_UI, FONT_UI_BLACK, FONT_UI_BOLD, FONT_MONO
-from app.ui.widgets import PowerButton, ServiceCard, ServiceRow, Sidebar, StatusBar
+from app.ui.widgets.catalog import CatalogView, CatalogItem
+from app.ui.widgets.scrolling import ScrollableFrame, Textbox
+from app.ui.widgets import PowerButton, Sidebar, StatusBar
 from app.vless_parser import parse_vless_url
 
 logger = logging.getLogger(__name__)
@@ -34,12 +38,18 @@ logger = logging.getLogger(__name__)
 
 class BoosterApp(ctk.CTk):
     def __init__(self) -> None:
+        from customtkinter.windows.widgets.core_rendering import DrawEngine
+        # Native polygons replace many per-corner font glyph items.
+        DrawEngine.preferred_drawing_method = "polygon_shapes"
         super().__init__()
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
 
         self.settings = load_settings()
         self.manager = SingBoxManager()
+        self._ui_results = queue.SimpleQueue()
+        self._worker_count = 0
+        self._worker_poll = None
         self._busy = False
         self._tray: pystray.Icon | None = None
         self._search_after: str | None = None
@@ -54,7 +64,7 @@ class BoosterApp(ctk.CTk):
         self._power_glow = 100
         self._power_anim_after: str | None = None
         self._connect_anim_after: str | None = None
-        self._items: dict[str, ServiceCard | ServiceRow] = {}
+        self._items: dict[str, CatalogItem] = {}
         self._catalog_built = False
         self._catalog_cols = 0
         self._filter_layout_sig: str | None = None
@@ -63,10 +73,7 @@ class BoosterApp(ctk.CTk):
         self._minimizing_to_tray = False
         self._current_page = "home"
         self._resize_after: str | None = None
-        self._resize_end_after: str | None = None
         self._last_win_size: tuple[int, int] | None = None
-        self._resize_shield_on = False
-        self._ui_frozen = False
         self._expect_running = False
         self._watch_after: str | None = None
 
@@ -87,6 +94,34 @@ class BoosterApp(ctk.CTk):
         self.after(0, self._finish_startup)
         self.after(600, self._maybe_admin_prompt)
         self.after(900, self._check_orphan_on_startup)
+
+    def _post_ui(self, delay, callback):
+        self._ui_results.put((delay, callback))
+
+    def _run_worker(self, work):
+        self._worker_count += 1
+        def run():
+            try:
+                work()
+            finally:
+                self._ui_results.put((None, None))
+        threading.Thread(target=run, daemon=True).start()
+        if self._worker_poll is None:
+            self._worker_poll = self.after(16, self._drain_workers)
+
+    def _drain_workers(self):
+        self._worker_poll = None
+        for _ in range(64):
+            try:
+                delay, callback = self._ui_results.get_nowait()
+            except queue.Empty:
+                break
+            if callback is None:
+                self._worker_count -= 1
+            else:
+                self.after(delay, callback)
+        if self._worker_count or not self._ui_results.empty():
+            self._worker_poll = self.after(16, self._drain_workers)
 
     def _apply_window_icons(self) -> None:
         import tkinter as tk
@@ -154,7 +189,7 @@ class BoosterApp(ctk.CTk):
         right.pack(side="left", fill="both", expand=True)
 
         self.main = ctk.CTkFrame(right, fg_color=COLORS["bg"], corner_radius=0)
-        self.main.pack(fill="both", expand=True)
+        self.main.pack(fill="both", expand=True, padx=24, pady=18)
 
         self.status_bar = StatusBar(right)
         self.status_bar.pack(fill="x", side="bottom")
@@ -181,7 +216,6 @@ class BoosterApp(ctk.CTk):
         self._show_page("home")
         self._refresh_server_labels()
         self.bind("<Configure>", self._on_window_configure)
-        self.after(50, self._harden_window_compositor)
 
     def _finish_startup(self) -> None:
         # No alpha fade — translucent frames cause DWM ghosting/blur artifacts.
@@ -192,103 +226,18 @@ class BoosterApp(ctk.CTk):
         self._power_glow = 100
         self._set_power_visual()
 
-    def _harden_window_compositor(self) -> None:
-        """Reduce Windows DWM transition artifacts on resize/move."""
-        if sys.platform != "win32":
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            hwnd = wintypes.HWND(int(self.winfo_id()))
-            # DWMWA_TRANSITIONS_FORCEDISABLED = 3
-            val = ctypes.c_int(1)
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(  # type: ignore[attr-defined]
-                hwnd, 3, ctypes.byref(val), ctypes.sizeof(val)
-            )
-        except Exception:
-            pass
-
-    def _set_widget_redraw(self, widget, enabled: bool) -> None:
-        if sys.platform != "win32":
-            return
-        try:
-            import ctypes
-
-            hwnd = int(widget.winfo_id())
-            # WM_SETREDRAW = 0x000B
-            ctypes.windll.user32.SendMessageW(hwnd, 0x000B, 1 if enabled else 0, 0)  # type: ignore[attr-defined]
-            if enabled:
-                try:
-                    widget.update_idletasks()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def _ensure_resize_cover(self):
-        if getattr(self, "_resize_cover", None) is None:
-            self._resize_cover = ctk.CTkFrame(
-                self.main, fg_color=COLORS["bg"], corner_radius=0, border_width=0
-            )
-        return self._resize_cover
-
-    def _begin_resize_shield(self) -> None:
-        if self._resize_shield_on:
-            return
-        self._resize_shield_on = True
-        self._ui_frozen = True
-        # Pause timers that force widget reconfigure mid-resize
-        self._stop_status_blink()
-        try:
-            cover = self._ensure_resize_cover()
-            cover.place(relx=0, rely=0, relwidth=1, relheight=1)
-            cover.lift()
-            # Paint cover once before the next resize storm
-            cover.update_idletasks()
-        except Exception:
-            pass
-
-    def _end_resize_shield(self) -> None:
-        self._resize_end_after = None
-        if not self._resize_shield_on:
-            return
-        self._resize_shield_on = False
-        self._ui_frozen = False
-        try:
-            if getattr(self, "_resize_cover", None) is not None:
-                self._resize_cover.place_forget()
-            # Force one clean composite after uncover
-            self.main.update_idletasks()
-        except Exception:
-            pass
-        if self.manager.running:
-            self._start_status_blink()
-        # Single layout pass after resize settles
-        if self._current_page == "boost" and self._view_mode == "cards" and self._catalog_built:
-            cols = self._catalog_columns()
-            if cols != self._catalog_cols:
-                self._relayout_catalog_columns()
-
     def _on_window_configure(self, event) -> None:
         if event.widget is not self:
             return
-        size = (int(event.width), int(event.height))
-        prev = self._last_win_size
+        size = (event.width, event.height)
+        if size == self._last_win_size:
+            return
         self._last_win_size = size
-        if prev is None:
+        if self._current_page != "boost" or self._view_mode != "cards":
             return
-        # Ignore pure moves (same size) — only shield on actual resize
-        if size == prev:
-            return
-        self._begin_resize_shield()
-        if self._resize_end_after:
-            try:
-                self.after_cancel(self._resize_end_after)
-            except Exception:
-                pass
-        # Settle after last resize event — one clean paint, no mid-drag redraw storms
-        self._resize_end_after = self.after(140, self._end_resize_shield)
+        if self._resize_after is not None:
+            self.after_cancel(self._resize_after)
+        self._resize_after = self.after(100, self._relayout_catalog_columns)
 
     def _catalog_columns(self) -> int:
         try:
@@ -303,8 +252,6 @@ class BoosterApp(ctk.CTk):
 
     def _relayout_catalog_columns(self) -> None:
         self._resize_after = None
-        if self._ui_frozen:
-            return
         if self._current_page != "boost" or self._view_mode != "cards" or not self._items:
             return
         cols = self._catalog_columns()
@@ -331,15 +278,12 @@ class BoosterApp(ctk.CTk):
                 elif name == "home":
                     self._refresh_home_services()
                 return
-            # Freeze redraw during page swap to avoid tear/ghost frames
-            self._set_widget_redraw(self.main, False)
-            try:
-                for p in pages.values():
-                    p.pack_forget()
-                pages[name].pack(fill="both", expand=True, padx=24, pady=18)
-                self._current_page = name
-            finally:
-                self._set_widget_redraw(self.main, True)
+            # Keep page geometry while hidden; switching never unmaps/rebuilds children.
+            pages[name].place(relx=0, rely=0, relwidth=1, relheight=1)
+            pages[name].lift()
+            if name != self._current_page:
+                pages[self._current_page].place_forget()
+            self._current_page = name
             if hasattr(self, "sidebar"):
                 self.sidebar.set_active(name)
             if name == "boost":
@@ -454,7 +398,7 @@ class BoosterApp(ctk.CTk):
             side="right"
         )
 
-        self.home_services = ctk.CTkScrollableFrame(
+        self.home_services = ScrollableFrame(
             page,
             fg_color=COLORS["bg"],
             corner_radius=0,
@@ -759,11 +703,11 @@ class BoosterApp(ctk.CTk):
         self.view_list_btn.pack(side="left", padx=(0, 3), pady=3)
 
         self.summary_lbl = ctk.CTkLabel(
-            toolbar, text="", font=ctk.CTkFont(size=12), text_color=COLORS["muted"]
+            page, text="", font=ctk.CTkFont(size=12), text_color=COLORS["muted"]
         )
-        self.summary_lbl.pack(side="right", padx=(0, 10))
+        self.summary_lbl.pack(anchor="e", pady=(0, 4))
 
-        self.catalog_host = ctk.CTkScrollableFrame(
+        self.catalog_host = CatalogView(
             page,
             fg_color=COLORS["bg"],
             corner_radius=0,
@@ -800,158 +744,35 @@ class BoosterApp(ctk.CTk):
         self._catalog_built = False
         self._ensure_catalog(force=True)
 
-    def _clear_catalog(self) -> None:
-        for child in self.catalog_host.winfo_children():
-            child.destroy()
-        self._items.clear()
-        self._catalog_built = False
-        self._catalog_cols = 0
-        self._filter_layout_sig = None
-
     def _ensure_catalog(self, *, force: bool = False) -> None:
         if self._catalog_built and self._items and not force:
             return
         with perf("Cards creation"):
-            self._render_catalog()
-
-    def _render_catalog(self) -> None:
-        self._clear_catalog()
-        q = (self.search_var.get() or "").strip().lower() if hasattr(self, "search_var") else ""
-        cat_label = self.cat_var.get() if hasattr(self, "cat_var") else "Все"
-        cat_id = None
-        if cat_label != "Все":
-            for k, v in CATEGORY_LABELS.items():
-                if v == cat_label:
-                    cat_id = k
-                    break
-
-        if self._view_mode == "cards":
-            cols = max(1, self._catalog_columns())
-            self.catalog_host.grid_columnconfigure(tuple(range(max(cols, 3))), weight=1)
-            row = col = 0
-            for preset in CATALOG:
-                card = ServiceCard(
-                    self.catalog_host,
-                    preset,
-                    enabled=self.settings.is_enabled(preset.id),
-                    icon=self._icon(preset, 44),
-                    on_toggle=self._on_toggle,
-                )
-                self._items[preset.id] = card
-                visible = True
-                if cat_id and preset.category != cat_id:
-                    visible = False
-                if visible and q:
-                    hay = f"{preset.name} {preset.description} {preset.id}".lower()
-                    visible = q in hay
-                if visible:
-                    card.place_grid(row, col, sticky="nsew", padx=6, pady=6)
-                    col += 1
-                    if col >= cols:
-                        col = 0
-                        row += 1
-                else:
-                    card.set_visible(False)
-            self._catalog_cols = cols
-        else:
-            for preset in CATALOG:
-                row_w = ServiceRow(
-                    self.catalog_host,
-                    preset,
-                    enabled=self.settings.is_enabled(preset.id),
-                    icon=self._icon(preset, 40),
-                    on_toggle=self._on_toggle,
-                )
-                self._items[preset.id] = row_w
-                visible = True
-                if cat_id and preset.category != cat_id:
-                    visible = False
-                if visible and q:
-                    hay = f"{preset.name} {preset.description} {preset.id}".lower()
-                    visible = q in hay
-                if visible:
-                    row_w.pack(fill="x", padx=2, pady=4)
-                    row_w._visible = True
-                else:
-                    row_w.set_visible(False)
-            self._catalog_cols = 1
-
-        self._filter_layout_sig = self._compute_filter_sig()
-        self._catalog_built = True
-
-    def _compute_filter_sig(self) -> str:
-        q = (self.search_var.get() or "").strip().lower() if hasattr(self, "search_var") else ""
-        cat = self.cat_var.get() if hasattr(self, "cat_var") else "Все"
-        cols = self._catalog_columns() if self._view_mode == "cards" else 1
-        return f"{self._view_mode}|{cols}|{cat}|{q}"
+            self._items = self.catalog_host.set_data(
+                CATALOG, self.settings.is_enabled,
+                {p.id: self._icon(p, 40) for p in CATALOG}, self._on_toggle)
+            self._catalog_built = True
+            self._filter_layout_sig = None
+            self._apply_filter()
 
     def _on_search_typed(self, _event=None) -> None:
         if self._search_after:
             self.after_cancel(self._search_after)
         self._search_after = self.after(140, self._apply_filter)
 
-    def _reset_catalog_scroll(self) -> None:
-        try:
-            canvas = getattr(self.catalog_host, "_parent_canvas", None)
-            if canvas is not None:
-                canvas.yview_moveto(0)
-        except Exception:
-            pass
-
     def _apply_filter(self) -> None:
-        if not self._items:
+        self._search_after = None
+        if not self._catalog_built:
             return
-        sig = self._compute_filter_sig()
-        if sig == self._filter_layout_sig:
-            return
-
         q = (self.search_var.get() or "").strip().lower()
-        cat_label = self.cat_var.get()
-        cat_id = None
-        if cat_label != "Все":
-            for k, v in CATEGORY_LABELS.items():
-                if v == cat_label:
-                    cat_id = k
-                    break
-
-        visible: list[ServiceCard | ServiceRow] = []
-        for preset in CATALOG:
-            item = self._items.get(preset.id)
-            if not item:
-                continue
-            ok = True
-            if cat_id and preset.category != cat_id:
-                ok = False
-            if ok and q:
-                hay = f"{preset.name} {preset.description} {preset.id}".lower()
-                ok = q in hay
-            if ok:
-                visible.append(item)
-            else:
-                item.set_visible(False)
-
-        if self._view_mode == "cards":
-            cols = max(1, self._catalog_columns())
-            try:
-                self.catalog_host.grid_columnconfigure(tuple(range(cols)), weight=1)
-            except Exception:
-                pass
-            row = col = 0
-            for item in visible:
-                assert isinstance(item, ServiceCard)
-                item.place_grid(row, col, sticky="nsew", padx=6, pady=6)
-                col += 1
-                if col >= cols:
-                    col = 0
-                    row += 1
-            self._catalog_cols = cols
-        else:
-            for item in visible:
-                assert isinstance(item, ServiceRow)
-                item.set_visible(True)
-
-        self._filter_layout_sig = sig
-        self._reset_catalog_scroll()
+        category = next((key for key,value in CATEGORY_LABELS.items() if value == self.cat_var.get()), None)
+        cols = self._catalog_columns() if self._view_mode == "cards" else 1
+        signature = (q, category, self._view_mode, cols)
+        if signature == self._filter_layout_sig:
+            return
+        self._filter_layout_sig = signature
+        self._catalog_cols = cols
+        self.catalog_host.filter(q, category, self._view_mode, cols)
 
     def _on_toggle(self, preset_id: str, value: bool) -> None:
         self.settings.set_enabled(preset_id, value)
@@ -961,12 +782,23 @@ class BoosterApp(ctk.CTk):
         self._refresh_home_services()
 
     def _update_summary(self) -> None:
+        import copy
         enabled = sum(1 for p in CATALOG if self.settings.is_enabled(p.id))
-        try:
-            procs, doms, ips = collect_routes(self.settings)
-            self.summary_lbl.configure(text=f"Выбрано: {enabled} · {len(doms)} сайтов")
-        except Exception:
-            self.summary_lbl.configure(text=f"Выбрано: {enabled}")
+        self.summary_lbl.configure(text=f"Выбрано: {enabled}")
+        self._summary_generation = getattr(self, "_summary_generation", 0) + 1
+        generation = self._summary_generation
+        snapshot = copy.deepcopy(self.settings)
+        def work():
+            try:
+                _, domains, _ = collect_routes(snapshot)
+                text = f"Выбрано: {enabled} · {len(domains)} сайтов"
+                def done():
+                    if generation == self._summary_generation:
+                        self.summary_lbl.configure(text=text)
+                self._post_ui(0, done)
+            except Exception:
+                logger.exception("summary failed")
+        self._run_worker(work)
 
     def _enable_popular(self) -> None:
         for p in CATALOG:
@@ -1000,7 +832,7 @@ class BoosterApp(ctk.CTk):
             text_color=COLORS["muted"],
         ).pack(anchor="w", pady=(0, 14))
 
-        box = ctk.CTkScrollableFrame(
+        box = ScrollableFrame(
             page,
             fg_color=COLORS["panel"],
             corner_radius=18,
@@ -1023,7 +855,7 @@ class BoosterApp(ctk.CTk):
             font=ctk.CTkFont(size=12),
             text_color=COLORS["muted"],
         ).pack(anchor="w", pady=(2, 6))
-        self.vless_box = ctk.CTkTextbox(
+        self.vless_box = Textbox(
             inner,
             height=96,
             corner_radius=12,
@@ -1085,7 +917,7 @@ class BoosterApp(ctk.CTk):
             font=ctk.CTkFont(size=12),
             text_color=COLORS["muted"],
         ).pack(anchor="w", pady=(0, 6))
-        self.custom_domains = ctk.CTkTextbox(
+        self.custom_domains = Textbox(
             inner,
             height=90,
             corner_radius=12,
@@ -1110,7 +942,7 @@ class BoosterApp(ctk.CTk):
             font=ctk.CTkFont(size=12),
             text_color=COLORS["muted"],
         ).pack(anchor="w", pady=(0, 6))
-        self.custom_procs = ctk.CTkTextbox(
+        self.custom_procs = Textbox(
             inner,
             height=70,
             corner_radius=12,
@@ -1168,14 +1000,14 @@ class BoosterApp(ctk.CTk):
                 else:
                     text = f"Пинг: нет ответа ({result.error or 'ошибка'}) — {result.host}:{result.port}"
                     color = COLORS["danger"]
-                self.after(0, lambda: self._set_ping_text(text, color))
+                self._post_ui(0, lambda: self._set_ping_text(text, color))
             except Exception as exc:
-                self.after(
+                self._post_ui(
                     0,
-                    lambda: self._set_ping_text(f"Пинг: ошибка — {exc}", COLORS["danger"]),
+                    lambda error=str(exc): self._set_ping_text(f"Пинг: ошибка — {error}", COLORS["danger"]),
                 )
 
-        threading.Thread(target=work, daemon=True).start()
+        self._run_worker(work)
 
     def _set_ping_text(self, text: str, color: str) -> None:
         if hasattr(self, "ping_lbl"):
@@ -1216,7 +1048,7 @@ class BoosterApp(ctk.CTk):
             return
         # Always refresh time — modal/resize must not freeze the counter.
         text = self._session_text()
-        if not (self._ui_frozen or self._resize_shield_on):
+        if self.winfo_viewable():
             if hasattr(self, "side_session_lbl"):
                 self.side_session_lbl.configure(text=f"Сессия: {text}")
             if hasattr(self, "stat_session"):
@@ -1252,9 +1084,9 @@ class BoosterApp(ctk.CTk):
                 return
             if not external or self.manager.running:
                 return
-            self.after(0, lambda: self._prompt_orphan(external))
+            self._post_ui(0, lambda: self._prompt_orphan(external))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._run_worker(work)
 
     def _prompt_orphan(self, external: list[tuple[int, str]]) -> None:
         if self.manager.running or not external:
@@ -1286,18 +1118,51 @@ class BoosterApp(ctk.CTk):
             self._refresh_status()
 
     def _check_active_connection(self) -> None:
-        def work() -> None:
+        import copy
+        if getattr(self, "_checking_connection", False):
+            return
+        self._checking_connection = True
+        snapshot = copy.deepcopy(self.manager.active_settings or self.settings)
+        probe_pid = self.manager.managed_pid()
+        self.footer_lbl.configure(text="Проверяю соединение…")
+        def work():
+            diagnostic = None
+            error = None
+            managed = self.manager.running
+            external = []
             try:
-                managed = self.manager.running
-                external = self.manager.external_instances()
-                self.after(0, lambda: self._show_connection_check(managed, external))
+                if managed:
+                    from app.connection_check import check_https_proxy
+                    from app.config_builder import PROTECT_DIRECT_DOMAINS
+                    # Only claim a tunnel test for a hostname actually routed to proxy.
+                    _, domains, _ = collect_routes(snapshot)
+                    protected = PROTECT_DIRECT_DOMAINS + snapshot.protect_domains
+                    target = next((d for d in domains if '*' not in d and not any(
+                        d == p or d.endswith('.'+p) for p in protected)), None)
+                    if target:
+                        diagnostic = check_https_proxy(snapshot.socks_port, target)
+                    else:
+                        diagnostic = "Ядро запущено. Для HTTPS-проверки выберите сервис с маршрутизацией сайтов."
+                else:
+                    external = self.manager.external_instances()
             except Exception as exc:
-                self.after(
-                    0,
-                    lambda: messagebox.showerror("Проверка", str(exc), parent=self),
-                )
-
-        threading.Thread(target=work, daemon=True).start()
+                error = str(exc)
+            def done():
+                self._checking_connection = False
+                if probe_pid != self.manager.managed_pid():
+                    return
+                if error:
+                    self.footer_lbl.configure(text="Проверка соединения не пройдена")
+                    logger.warning("Connection diagnostic failed: %s", error)
+                    messagebox.showwarning("Проверка соединения", error, parent=self)
+                elif diagnostic:
+                    self.footer_lbl.configure(text="Проверка соединения завершена")
+                    logger.info("Connection diagnostic: %s", diagnostic)
+                    messagebox.showinfo("Проверка соединения", diagnostic, parent=self)
+                else:
+                    self._show_connection_check(managed, external)
+            self._post_ui(0, done)
+        self._run_worker(work)
 
     def _show_connection_check(
         self,
@@ -1418,7 +1283,7 @@ class BoosterApp(ctk.CTk):
             height=40,
         ).pack(anchor="w", pady=10)
 
-        self.lists_log = ctk.CTkTextbox(
+        self.lists_log = Textbox(
             inner,
             corner_radius=12,
             fg_color=COLORS["elevated"],
@@ -1474,12 +1339,12 @@ class BoosterApp(ctk.CTk):
                             f"✓ {pid}: сайтов {stats.get('domains', 0)}, IP {stats.get('ips', 0)}"
                         )
                 msg = "\n".join(lines) or "Нечего обновлять"
-                self.after(0, lambda: self._lists_done(msg))
+                self._post_ui(0, lambda: self._lists_done(msg))
             except Exception as exc:
                 err = str(exc) or repr(exc)
-                self.after(0, lambda m=err: self._lists_done(f"Ошибка: {m}"))
+                self._post_ui(0, lambda m=err: self._lists_done(f"Ошибка: {m}"))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._run_worker(work)
 
     def _lists_done(self, msg: str) -> None:
         self._busy = False
@@ -1519,7 +1384,7 @@ class BoosterApp(ctk.CTk):
             text_color=COLORS["muted"],
         ).pack(side="right")
 
-        self.app_logs = ctk.CTkTextbox(
+        self.app_logs = Textbox(
             page,
             corner_radius=14,
             fg_color=COLORS["card"],
@@ -1532,23 +1397,30 @@ class BoosterApp(ctk.CTk):
         enable_text_clipboard(self.app_logs)
 
     def _refresh_logs(self) -> None:
-        from app.paths import LOG_PATH
-
-        if not hasattr(self, "app_logs"):
+        if getattr(self, "_logs_loading", False):
             return
-        trim_log_file()
-        self.app_logs.delete("1.0", "end")
-        try:
-            if LOG_PATH.exists():
-                text = LOG_PATH.read_text(encoding="utf-8", errors="replace")
-                lines = text.splitlines()
-                text = "\n".join(lines[-800:])
-                self.app_logs.insert("1.0", text or "(пусто)")
-            else:
-                self.app_logs.insert("1.0", f"Файл ещё не создан:\n{LOG_PATH}")
-        except Exception as exc:
-            self.app_logs.insert("1.0", f"Не удалось прочитать лог: {exc}")
-        self.app_logs.see("end")
+        self._logs_loading = True
+        def work():
+            from app.paths import LOG_PATH
+            try:
+                with LOG_PATH.open("rb") as fh:
+                    fh.seek(0, 2)
+                    size = fh.tell()
+                    fh.seek(max(0, size - 256 * 1024))
+                    data = fh.read()
+                lines = data.decode("utf-8", errors="replace").splitlines()
+                text = "\n".join(lines[-800:]) or "(пусто)"
+            except OSError as exc:
+                text = f"Журнал недоступен: {exc}"
+            def done():
+                self._logs_loading = False
+                if text != getattr(self, "_last_log_text", None):
+                    self._last_log_text = text
+                    self.app_logs.delete("1.0", "end")
+                    self.app_logs.insert("1.0", text)
+                    self.app_logs.see("end")
+            self._post_ui(0, done)
+        self._run_worker(work)
 
     def _clear_logs(self) -> None:
         from app.paths import LOG_PATH
@@ -1604,7 +1476,7 @@ class BoosterApp(ctk.CTk):
             width=220,
             height=44,
         ).pack(anchor="w")
-        self.update_log = ctk.CTkTextbox(
+        self.update_log = Textbox(
             inner,
             corner_radius=12,
             fg_color=COLORS["elevated"],
@@ -1627,6 +1499,11 @@ class BoosterApp(ctk.CTk):
         self._busy = True
         self.update_log.insert("end", "\nПроверяю…\n")
 
+        raw = self.vless_box.get("1.0", "end").strip()
+        if raw:
+            self.settings.vless_url = raw
+        save_settings(self.settings)
+
         def work() -> None:
             try:
                 from app.updater import (
@@ -1636,21 +1513,11 @@ class BoosterApp(ctk.CTk):
                     launch_apply_and_exit,
                 )
 
-                # Persist link/settings before replacing the exe
-                try:
-                    if hasattr(self, "vless_box"):
-                        raw = self.vless_box.get("1.0", "end").strip()
-                        if raw:
-                            self.settings.vless_url = raw
-                    save_settings(self.settings)
-                except Exception:
-                    pass
-
                 upd = check_windows_update()
                 if not upd:
-                    self.after(0, lambda: self._update_done("Обновлений нет."))
+                    self._post_ui(0, lambda: self._update_done("Обновлений нет."))
                     return
-                self.after(
+                self._post_ui(
                     0,
                     lambda: self.update_log.insert(
                         "end", f"Найдено {upd.version}, скачиваю…\n"
@@ -1687,12 +1554,12 @@ class BoosterApp(ctk.CTk):
                         )
                         self.update_log.see("end")
 
-                self.after(0, ask)
+                self._post_ui(0, ask)
             except Exception as exc:
                 err = str(exc) or repr(exc)
-                self.after(0, lambda m=err: self._update_done(f"Ошибка: {m}"))
+                self._post_ui(0, lambda m=err: self._update_done(f"Ошибка: {m}"))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._run_worker(work)
 
     def _update_done(self, msg: str) -> None:
         self._busy = False
@@ -1738,17 +1605,19 @@ class BoosterApp(ctk.CTk):
             self.home_title_lbl.configure(text="Подключение…", text_color=COLORS["accent"])
         self._start_connect_animation()
 
+        import copy
+        settings_snapshot = copy.deepcopy(self.settings)
+
         def work() -> None:
             try:
-                self.settings = load_settings()
-                self.manager.start(self.settings, kill_external=True)
-                self.after(0, lambda: self._after_start(True, "Ускорение включено"))
+                self.manager.start(settings_snapshot, kill_external=True)
+                self._post_ui(0, lambda: self._after_start(True, "Ускорение включено"))
             except Exception as exc:
                 logger.exception("start failed")
                 err = str(exc) or repr(exc)
-                self.after(0, lambda m=err: self._after_start(False, m))
+                self._post_ui(0, lambda m=err: self._after_start(False, m))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._run_worker(work)
 
     def _after_start(self, ok: bool, msg: str) -> None:
         self._busy = False
@@ -1769,13 +1638,26 @@ class BoosterApp(ctk.CTk):
             messagebox.showerror("Не удалось включить", msg, parent=self)
 
     def _stop(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
         self._expect_running = False
         self._stop_singbox_watch()
-        try:
-            self.manager.stop()
-        except Exception as exc:
-            messagebox.showerror("Ошибка", str(exc), parent=self)
-        self._refresh_status()
+        self.boost_btn.configure(state="disabled")
+        def work():
+            error = None
+            try:
+                self.manager.stop()
+            except Exception as exc:
+                error = str(exc)
+            def done():
+                self._busy = False
+                self.boost_btn.configure(state="normal")
+                self._refresh_status()
+                if error:
+                    messagebox.showerror("Ошибка", error, parent=self)
+            self._post_ui(0, done)
+        self._run_worker(work)
 
     def _start_singbox_watch(self) -> None:
         self._stop_singbox_watch()
@@ -1827,7 +1709,7 @@ class BoosterApp(ctk.CTk):
         self._status_blink_after = None
         if not self.manager.running:
             return
-        if self._ui_frozen or self._resize_shield_on or not self.winfo_viewable():
+        if not self.winfo_viewable():
             self._status_blink_after = self.after(1000, self._tick_status_blink)
             return
         self._status_blink_bright = not self._status_blink_bright
@@ -1908,7 +1790,7 @@ class BoosterApp(ctk.CTk):
         if self._minimizing_to_tray:
             return
         try:
-            if self.state() == "iconic":
+            if self.state() == "iconic" and self.settings.minimize_to_tray:
                 self._minimizing_to_tray = True
                 self.after(30, self._minimize_to_tray)
         except Exception:
@@ -1919,12 +1801,6 @@ class BoosterApp(ctk.CTk):
         if event is not None and getattr(event, "widget", None) is not self:
             return
         self._minimizing_to_tray = False
-        # Brief shield avoids ghost frames from DWM restore composite
-        try:
-            self._begin_resize_shield()
-            self.after(100, self._end_resize_shield)
-        except Exception:
-            pass
 
     def _minimize_to_tray(self) -> None:
         try:
@@ -1974,13 +1850,11 @@ class BoosterApp(ctk.CTk):
             except Exception:
                 ext = []
             try:
-                if not self.winfo_exists():
-                    return
-                self.after(0, lambda e=ext: self._apply_external_status(e))
+                self._post_ui(0, lambda e=ext: self._apply_external_status(e))
             except RuntimeError:
                 return
 
-        threading.Thread(target=work, daemon=True).start()
+        self._run_worker(work)
 
     def _apply_idle_status_ui(self) -> None:
         self._stop_status_blink()

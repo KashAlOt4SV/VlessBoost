@@ -38,7 +38,7 @@ class Sidebar(ctk.CTkFrame):
         self._on_nav = on_nav
         self._nav_btns: dict[str, ctk.CTkButton] = {}
         self._nav_accents: dict[str, ctk.CTkFrame] = {}
-        self._active = "home"
+        self._active = None
 
         brand = ctk.CTkFrame(self, fg_color="transparent")
         brand.pack(fill="x", padx=18, pady=(22, 16))
@@ -136,8 +136,13 @@ class Sidebar(ctk.CTkFrame):
         self.set_active("home")
 
     def set_active(self, key: str) -> None:
+        previous = self._active
+        if previous == key:
+            return
         self._active = key
         for k, btn in self._nav_btns.items():
+            if previous is not None and k not in (previous, key):
+                continue
             active = k == key
             btn.configure(
                 fg_color=COLORS["nav_active"] if active else "transparent",

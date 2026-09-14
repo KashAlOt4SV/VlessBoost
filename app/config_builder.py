@@ -127,6 +127,12 @@ def build_singbox_config(settings: Settings) -> dict[str, Any]:
     if protect:
         dns_rules.insert(0, {"domain_suffix": uniq_list(protect), "server": "dns-direct"})
 
+    import ipaddress
+    try:
+        ipaddress.ip_address(endpoint.server)
+    except ValueError:
+        dns_rules.insert(0, {"domain": [endpoint.server], "server": "dns-bootstrap"})
+
     return {
         "log": {"level": settings.log_level or "info", "timestamp": True},
         "dns": {
@@ -159,7 +165,7 @@ def build_singbox_config(settings: Settings) -> dict[str, Any]:
                 "tag": "tun-in",
                 "interface_name": settings.tun_interface or "vless-split",
                 "address": ["172.19.0.1/30"],
-                # 1500 + VLESS/TLS overhead fragments Discord voice/Go Live UDP.
+                # Conservative existing TUN MTU; actual path MTU must be measured.
                 "mtu": 1400,
                 "auto_route": True,
                 # strict_route=true часто ломает обычный (direct) трафик на Windows
