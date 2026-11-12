@@ -78,6 +78,22 @@ def resolve_endpoint(host):
         return sorted(addresses)
 
 
+def wait_for_tunnel_addresses(addresses):
+    """Wait for Windows to finish assigning usable addresses to the AWG adapter."""
+    expected = [str(ipaddress.ip_address(address)) for address in addresses]
+    literals = ",".join("'" + address + "'" for address in expected)
+    powershell(
+        f"$expected=@({literals}); $deadline=(Get-Date).AddSeconds(25); "
+        "do { $a=Get-NetAdapter -Name 'VEIL-AWG' -ErrorAction SilentlyContinue; "
+        "$ready=@(); if($a -and $a.Status -eq 'Up'){ "
+        "$ready=@(Get-NetIPAddress -InterfaceIndex $a.ifIndex -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.AddressState -eq 'Preferred' } | ForEach-Object { ([System.Net.IPAddress]::Parse($_.IPAddress)).ToString() }) }; "
+        "$missing=@($expected | Where-Object { $_ -notin $ready }); "
+        "if($missing.Count -eq 0){return}; Start-Sleep -Milliseconds 200 "
+        "} while((Get-Date) -lt $deadline); "
+        "throw 'AWG adapter address readiness timeout'", timeout=35)
+
+
 def protect_bytes(data: bytes) -> bytes:
     """DPAPI machine scope: the tunnel service runs as LocalSystem."""
     class Blob(ctypes.Structure):
@@ -248,6 +264,11 @@ class AmneziaWGManager:
                         "Set-NetIPInterface -InterfaceAlias 'VEIL-AWG' -AddressFamily IPv6 -AutomaticMetric Disabled -InterfaceMetric 6000; "
                         "New-NetRoute -InterfaceAlias 'VEIL-AWG' -AddressFamily IPv6 -DestinationPrefix '::/0' "
                         "-NextHop '::' -RouteMetric 6000 -PolicyStore ActiveStore | Out-Null")
+                addresses = [profile.ipv4]
+                if config["outbounds"][0].get("inet6_bind_address"):
+                    addresses.append(config["outbounds"][0]["inet6_bind_address"])
+                wait_for_tunnel_addresses(addresses)
+                log.info("AWG adapter addresses ready")
                 self._check_cancelled()
                 # Preserve an explicit physical route while TUN is active. The
                 # native service's own bind cannot override a more specific TUN route.

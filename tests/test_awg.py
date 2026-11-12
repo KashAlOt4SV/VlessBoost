@@ -92,6 +92,15 @@ class ProfileTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_address_readiness_wait_checks_the_expected_usable_addresses(self):
+        from app.amneziawg import wait_for_tunnel_addresses
+        with patch("app.amneziawg.powershell") as shell:
+            wait_for_tunnel_addresses(["10.8.0.2", "fd00::2"])
+        script = shell.call_args.args[0]
+        self.assertIn("'10.8.0.2','fd00::2'", script)
+        self.assertIn("AddressState -eq 'Preferred'", script)
+        self.assertIn("AWG adapter address readiness timeout", script)
+
     def test_generated_awg_router_config_passes_real_core_validation(self):
         import subprocess
         from app.paths import SINGBOX_EXE
@@ -128,6 +137,32 @@ class LifecycleTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "offline probe"):
                     manager.start(Settings(awg_config=PROFILE))
             manager.router.start.assert_called_once()
+
+    def test_address_readiness_failure_stops_before_router_start(self):
+        manager = AmneziaWGManager()
+        manager.router = MagicMock()
+        manager.router.running = False
+        def shell(script, *args, **kwargs):
+            if "ProductVersion" in script:
+                return "3.1.0"
+            if "Get-NetRoute" in script:
+                return json.dumps({"InterfaceAlias": "Ethernet", "InterfaceIndex": 4, "NextHop": "192.168.1.1"})
+            if "address readiness timeout" in script:
+                raise RuntimeError("address readiness timeout")
+            return ""
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("app.amneziawg.PROFILE_PATH", Path(directory)/"profile.conf.dpapi"), \
+             patch("app.amneziawg.is_admin", return_value=True), \
+             patch("app.amneziawg.find_binary", return_value=Path("amneziawg.exe")), \
+             patch("app.amneziawg.resolve_endpoint", return_value=["203.0.113.9"]), \
+             patch("app.amneziawg.powershell", side_effect=shell), \
+             patch("app.amneziawg.protect_bytes", return_value=b"encrypted"), \
+             patch("app.amneziawg.command", return_value=""), \
+             patch("app.amneziawg.service_state", side_effect=[0, 4, 0, 0]):
+            with self.assertRaisesRegex(RuntimeError, "address readiness timeout"):
+                manager.start(Settings(awg_config=PROFILE))
+        manager.router.start.assert_not_called()
+        manager.router.stop.assert_called_once()
 
     def test_failed_native_start_rolls_back_only_owned_service(self):
         manager = AmneziaWGManager()
