@@ -13,6 +13,9 @@ config/cache/
 presets/user_overrides.json
 build/
 build-preview*/
+build-smoke/
+dist-smoke/
+dist-fix/
 build-release/
 dist/
 dist-preview*/
@@ -20,6 +23,7 @@ dist-release/
 dist-release-*/
 *.spec.bak
 *.zip
+release-assets/
 
 # Android
 android/.gradle/

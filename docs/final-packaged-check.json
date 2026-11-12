@@ -1,0 +1,10 @@
+{
+  "startup_window_ms": 362.61,
+  "navigation_80_total_ms": 119.54,
+  "pages_reused": true,
+  "maximize_restore_10_cycles_ok": true,
+  "worker_completed": true,
+  "max_ui_tick_gap_ms": 17.69,
+  "event_loop_ticks_during_worker": 40,
+  "ok": true
+}

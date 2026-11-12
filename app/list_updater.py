@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 import time
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -100,10 +101,13 @@ class ListCache:
 LIST_CACHE = ListCache()
 
 
-def _fetch_text(url: str, timeout: int = 60) -> str:
+def _fetch_text(url: str, timeout: int = 15) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+        data = resp.read(16_000_001)
+        if len(data) > 16_000_000:
+            raise ValueError("Список превышает 16 МБ")
+        return data.decode("utf-8", errors="replace")
 
 
 def parse_domain_list(text: str, fmt: str) -> list[str]:
@@ -143,7 +147,9 @@ def update_preset_lists(preset: Preset) -> dict[str, int]:
         text = _fetch_text(preset.remote_domains_url)
         domains = parse_domain_list(text, preset.remote_domains_format or "plain")
         path = CACHE_DIR / f"{preset.id}.domains.txt"
-        path.write_text("\n".join(domains) + ("\n" if domains else ""), encoding="utf-8")
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text("\n".join(domains) + ("\n" if domains else ""), encoding="utf-8")
+        temporary.replace(path)
         stats["domains"] = len(domains)
 
     if preset.remote_ip_url:
@@ -151,13 +157,15 @@ def update_preset_lists(preset: Preset) -> dict[str, int]:
         text = _fetch_text(preset.remote_ip_url)
         ips = parse_ip_list(text)
         path = CACHE_DIR / f"{preset.id}.ipcidr.txt"
-        path.write_text("\n".join(ips) + ("\n" if ips else ""), encoding="utf-8")
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text("\n".join(ips) + ("\n" if ips else ""), encoding="utf-8")
+        temporary.replace(path)
         stats["ips"] = len(ips)
 
     return stats
 
 
-def update_all_remote(preset_ids: list[str] | None = None) -> dict[str, dict[str, int]]:
+def update_all_remote(preset_ids: list[str] | None = None, *, cancel_event=None) -> dict[str, dict[str, int]]:
     """Download remote lists in parallel. Invalidates ListCache status memo."""
     LIST_CACHE.invalidate()
     results: dict[str, dict[str, int]] = {}
@@ -168,7 +176,7 @@ def update_all_remote(preset_ids: list[str] | None = None) -> dict[str, dict[str
         ids = [p.id for p in CATALOG if p.remote_domains_url or p.remote_ip_url]
 
     jobs: list[Preset] = []
-    for pid in ids:
+    for pid in dict.fromkeys(ids):
         preset = get_preset(pid)
         if not preset:
             continue
@@ -186,12 +194,30 @@ def update_all_remote(preset_ids: list[str] | None = None) -> dict[str, dict[str
     if not jobs:
         return results
 
-    workers = min(_MAX_WORKERS, len(jobs))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(_one, p) for p in jobs]
-        for fut in as_completed(futs):
-            pid, stats = fut.result()
-            results[pid] = stats  # type: ignore[assignment]
+    cancelled = cancel_event or threading.Event()
+    pending = queue.Queue()
+    completed = queue.Queue()
+    for preset in jobs:
+        pending.put(preset)
+
+    def run():
+        while not cancelled.is_set():
+            try:
+                preset = pending.get_nowait()
+            except queue.Empty:
+                return
+            completed.put(_one(preset))
+
+    # Daemon workers let a closed client exit immediately even if a remote
+    # provider is unresponsive. Network work never owns the GUI lifecycle.
+    for index in range(min(_MAX_WORKERS, len(jobs))):
+        threading.Thread(target=run, daemon=True, name=f"veil-list-{index}").start()
+    while len(results) < len(jobs) and not cancelled.is_set():
+        try:
+            pid, stats = completed.get(timeout=.1)
+        except queue.Empty:
+            continue
+        results[pid] = stats
 
     LIST_CACHE.remember_results(results)
     return results

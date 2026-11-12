@@ -17,6 +17,7 @@ from app.config_builder import write_singbox_config
 from app.paths import BIN_DIR, LOG_PATH, SINGBOX_CONFIG_PATH, SINGBOX_EXE
 from app.settings import Settings
 from app.startup_check import CoreOutput, wait_for_proxy
+from app.process_job import ChildJob
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,7 @@ class SingBoxManager:
         self._proc: subprocess.Popen[str] | None = None
         self.active_settings: Settings | None = None
         self._output: CoreOutput | None = None
+        self._job = None
         BIN_DIR.mkdir(parents=True, exist_ok=True)
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -207,7 +209,7 @@ class SingBoxManager:
                 raise RuntimeError("В архиве sing-box нет sing-box.exe")
             shutil.copy2(found, SINGBOX_EXE)
 
-    def start(self, settings: Settings, *, kill_external: bool = True) -> None:
+    def start(self, settings: Settings, *, kill_external: bool = True, config=None) -> None:
         if self.running:
             return
         if not is_admin():
@@ -218,7 +220,10 @@ class SingBoxManager:
 
         self.ensure_binary()
         logger.info("Starting core: tun=%s local_port=%s", settings.tun_interface, settings.socks_port)
-        write_singbox_config(settings)
+        if config is None:
+            write_singbox_config(settings)
+        else:
+            SINGBOX_CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
         check = subprocess.run(
             [str(SINGBOX_EXE), "check", "-c", str(SINGBOX_CONFIG_PATH)],
@@ -244,6 +249,7 @@ class SingBoxManager:
             cwd=str(BIN_DIR), creationflags=_create_no_window(),
         )
         self._output = CoreOutput(self._proc.stdout)
+        self._job = ChildJob(self._proc)
         self._output.start()
         try:
             wait_for_proxy(self._proc, settings.socks_port)
@@ -296,6 +302,10 @@ class SingBoxManager:
                 self._output.finish()
                 self._output = None
             self._proc = None
+            job = getattr(self, "_job", None)
+            if job:
+                job.close()
+                self._job = None
             self.active_settings = None
             logger.info("sing-box остановлен")
 

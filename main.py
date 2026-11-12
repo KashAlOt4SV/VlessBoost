@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from logging.handlers import RotatingFileHandler
 import sys
 from pathlib import Path
 
@@ -17,7 +18,7 @@ def _windows_app_id() -> None:
         import ctypes
 
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(  # type: ignore[attr-defined]
-            "VLESS.Boost.App.1"
+            "VEIL.NetworkAccelerator.2"
         )
     except Exception:
         pass
@@ -42,30 +43,24 @@ def setup_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
-            logging.FileHandler(LOG_PATH, encoding="utf-8"),
+            RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=2, encoding="utf-8"),
             logging.StreamHandler(sys.stdout),
         ],
     )
 
 
 def main() -> int:
+    if "--self-check" in sys.argv:
+        from app.self_check import run
+        index = sys.argv.index("--self-check")
+        return run(sys.argv[index + 1])
     if not ensure_single_instance():
         notify_already_running()
         return 0
 
     setup_logging()
     log = logging.getLogger(__name__)
-    log.info("VLESS Boost starting")
-
-    try:
-        from app.updater import abort_stuck_apply_scripts, apply_pending_update_on_startup
-
-        abort_stuck_apply_scripts()
-        if apply_pending_update_on_startup():
-            log.info("Exiting to apply pending OTA update")
-            return 0
-    except Exception:
-        log.exception("pending update check failed")
+    log.info("VEIL starting — AmneziaWG 3.1")
 
     run_app()
     return 0

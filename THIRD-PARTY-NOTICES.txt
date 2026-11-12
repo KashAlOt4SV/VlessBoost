@@ -1,0 +1,22 @@
+VEIL 2.0 Windows runtime
+
+AmneziaWG Windows Client 3.1.0 and AmneziaWG-Go/Wintun dependencies.
+Copyright their respective authors; official unmodified Windows binaries.
+Source, license and release: https://github.com/amnezia-vpn/amneziawg-windows-client
+https://github.com/amnezia-vpn/amneziawg-windows
+https://github.com/amnezia-vpn/amneziawg-go
+https://www.wintun.net/
+
+sing-box 1.11.15, Copyright SagerNet and contributors.
+Source and license: https://github.com/SagerNet/sing-box/tree/v1.11.15
+
+PySide6 / Qt Essentials 6.12.0 and Shiboken6, Copyright The Qt Company and contributors.
+Source and licensing information: https://code.qt.io/pyside/pyside-setup.git/
+https://www.qt.io/licensing/open-source-lgpl-obligations
+Qt and PySide6 DLLs are distributed dynamically in _internal and may be replaced
+with compatible builds. This package does not statically link Qt.
+
+Python 3.11, Python Software Foundation: https://docs.python.org/3/license.html
+PyInstaller: https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt
+
+This notices file does not replace the upstream license texts.

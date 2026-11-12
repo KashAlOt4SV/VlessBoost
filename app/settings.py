@@ -12,6 +12,11 @@ from app.presets import CATALOG
 @dataclass
 class Settings:
     vless_url: str = ""
+    # Windows transport. VLESS is retained only for importing legacy settings.
+    transport: str = "amneziawg"
+    awg_config: str = ""
+    profile_name: str = "Мой сервер"
+    reduce_motion: bool = False
     # Какие пресеты включены
     enabled: dict[str, bool] = field(default_factory=dict)
     # Бустить также процессы из включённых пресетов
@@ -69,6 +74,9 @@ def load_settings() -> Settings:
         return settings
     with SETTINGS_PATH.open("r", encoding="utf-8") as fh:
         data = json.load(fh)
+    from app.secrets import unseal
+    if data.get("awg_config"):
+        data["awg_config"] = unseal(data["awg_config"])
     settings = Settings.from_dict(data)
     # Добавляем новые пресеты, которых ещё нет в файле
     for p in CATALOG:
@@ -78,6 +86,11 @@ def load_settings() -> Settings:
 
 
 def save_settings(settings: Settings) -> None:
+    from app.secrets import seal
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with SETTINGS_PATH.open("w", encoding="utf-8") as fh:
-        json.dump(deepcopy(settings.to_dict()), fh, ensure_ascii=False, indent=2)
+    data = deepcopy(settings.to_dict())
+    data["awg_config"] = seal(data["awg_config"])
+    temporary = SETTINGS_PATH.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+    temporary.replace(SETTINGS_PATH)

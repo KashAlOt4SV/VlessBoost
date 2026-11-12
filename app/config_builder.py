@@ -85,16 +85,20 @@ def collect_routes(settings: Settings) -> tuple[list[str], list[str], list[str]]
     return uniq(processes), uniq(domains), uniq(ips)
 
 
-def build_singbox_config(settings: Settings) -> dict[str, Any]:
-    if not settings.vless_url.strip():
+def build_singbox_config(settings: Settings, *, proxy_outbound=None, server_host=None) -> dict[str, Any]:
+    if proxy_outbound is None and not settings.vless_url.strip():
         raise ValueError("Сначала укажите VLESS ссылку в настройках")
 
     processes, domains, ips = collect_routes(settings)
     if not processes and not domains and not ips:
         raise ValueError("Включите хотя бы один сервис или добавьте свои домены")
 
-    endpoint = parse_vless_url(settings.vless_url)
-    proxy = endpoint_to_singbox_outbound(endpoint, tag="proxy")
+    if proxy_outbound is None:
+        endpoint = parse_vless_url(settings.vless_url)
+        proxy = endpoint_to_singbox_outbound(endpoint, tag="proxy")
+        server_host = endpoint.server
+    else:
+        proxy = proxy_outbound
 
     protect = list(PROTECT_DIRECT_DOMAINS)
     if getattr(settings, "protect_direct", True):
@@ -129,9 +133,9 @@ def build_singbox_config(settings: Settings) -> dict[str, Any]:
 
     import ipaddress
     try:
-        ipaddress.ip_address(endpoint.server)
+        ipaddress.ip_address(server_host)
     except ValueError:
-        dns_rules.insert(0, {"domain": [endpoint.server], "server": "dns-bootstrap"})
+        dns_rules.insert(0, {"domain": [server_host], "server": "dns-bootstrap"})
 
     return {
         "log": {"level": settings.log_level or "info", "timestamp": True},
