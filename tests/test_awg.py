@@ -109,7 +109,7 @@ class LifecycleTests(unittest.TestCase):
         manager = AmneziaWGManager()
         manager.router = MagicMock()
         manager.router.running = False
-        def shell(script, *args):
+        def shell(script, *args, **kwargs):
             if "ProductVersion" in script:
                 return "3.1.0"
             if "Get-NetRoute" in script:
