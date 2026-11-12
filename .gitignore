@@ -24,6 +24,8 @@ dist-release-*/
 *.spec.bak
 *.zip
 release-assets/
+tmp/pdfs/
+output/pdf/
 
 # Android
 android/.gradle/
