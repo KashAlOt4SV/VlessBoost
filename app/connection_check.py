@@ -2,6 +2,21 @@
 import socket
 import ssl
 import time
+from functools import lru_cache
+
+import certifi
+
+
+@lru_cache(maxsize=1)
+def tls_context():
+    """Keep Windows/custom trust, supplement it with the shipped Mozilla roots.
+
+    Some PCs have an incomplete Windows root store. Frozen Python does not
+    fetch missing issuers like a browser may. Never turn off chain/host checks.
+    """
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile=certifi.where())
+    return context
 
 
 def read_exact(sock, length, deadline=None):
@@ -49,7 +64,7 @@ def check_https_proxy(port, host, timeout=8.0):
         else:
             raise ConnectionError('Invalid SOCKS5 address type')
         budget(sock)
-        with ssl.create_default_context().wrap_socket(sock,server_hostname=host) as tls:
+        with tls_context().wrap_socket(sock,server_hostname=host) as tls:
             budget(tls)
             tls.sendall(f'HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n'.encode('ascii'))
             response=bytearray()

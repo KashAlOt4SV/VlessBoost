@@ -866,7 +866,12 @@ class VeilWindow(QMainWindow):
         self.top_status.setStyleSheet("color: #6ee7bd")
         self.metric_values[2].setText("Активен")
         self.metric_notes[2].setText("Подключение проверено")
-        self.notice.hide()
+        self._health_notice = getattr(self.manager, "health_warning", None)
+        if isinstance(self._health_notice, str) and self._health_notice:
+            self.metric_notes[2].setText("Handshake AWG подтверждён")
+            self._notify(self._health_notice)
+        else:
+            self.notice.hide()
         self.chart.samples.clear()
         self._last_probe = 0
         self._tick()
@@ -934,16 +939,15 @@ class VeilWindow(QMainWindow):
             if probe:
                 started = time.monotonic()
                 try:
-                    check_https_proxy(probe_port, "one.one.one.one", timeout=6)
-                    latency = round((time.monotonic()-started)*1000)
-                except (OSError, ValueError):
+                    latency = self.manager.check_health(probe_port, timeout=6, stats=stats)
+                except (OSError, ValueError, RuntimeError):
                     pass
-            return stats, probe, latency
+            return stats, probe, latency, self.manager.health_warning
         def done(result):
             self._telemetry_pending = False
             if not self.connected or self.busy or session_id != self._session_id:
                 return
-            stats, probed, latency = result
+            stats, probed, latency, health_warning = result
             if not stats["alive"]:
                 self._notify("Служба AWG остановилась. Отключаем маршрутизацию.")
                 self._disconnect()
@@ -952,9 +956,19 @@ class VeilWindow(QMainWindow):
                 self.chart.samples.append(latency)
                 self.chart.update()
                 self.metric_values[0].setText(f"{latency} мс" if latency is not None else "—")
-                self.metric_notes[0].setText("HTTPS через AWG" if latency is not None else "Проверка не прошла")
-                self.metric_values[2].setText("Активен" if latency is not None else "Нет ответа")
-                self.metric_notes[2].setText("Туннель отвечает" if latency is not None else "Служба работает, сервер не отвечает")
+                certificate_issue = bool(health_warning and self.manager.has_fresh_handshake(stats))
+                self.metric_notes[0].setText("HTTPS через AWG" if latency is not None else
+                                           "Ошибка сертификата HTTPS" if certificate_issue else "Проверка не прошла")
+                self.metric_values[2].setText("Активен" if latency is not None or certificate_issue else "Нет ответа")
+                self.metric_notes[2].setText("Handshake AWG подтверждён" if certificate_issue else
+                                           "Туннель отвечает" if latency is not None else "Проверка связи не прошла")
+                if certificate_issue:
+                    self._health_notice = health_warning
+                    self._notify(health_warning)
+                elif latency is not None and getattr(self, "_health_notice", None):
+                    if self.notice.text() == self._health_notice:
+                        self.notice.hide()
+                    self._health_notice = None
             if stats["rx"] is not None:
                 now = time.monotonic()
                 if self._last_transfer:

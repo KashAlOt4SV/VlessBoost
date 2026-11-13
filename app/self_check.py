@@ -19,6 +19,11 @@ def run(report_path):
     window.show()
     app.processEvents()
     report = {"startup_window_ms": round((time.perf_counter()-started)*1000, 2)}
+    import ssl
+    from app.connection_check import tls_context
+    context = tls_context()
+    report["trusted_ca_count"] = context.cert_store_stats()["x509_ca"]
+    report["tls_verification_required"] = context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
     before = time.perf_counter()
     pages = [window.stack.widget(i) for i in range(4)]
     for i in range(80):
@@ -58,7 +63,8 @@ def run(report_path):
         output = Path(report_path).resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         window.grab().save(str(output.with_suffix(".png")))
-        report["ok"] = bool(report["pages_reused"] and restored and report.get("worker_completed") and len(gaps) > 15)
+        report["ok"] = bool(report["pages_reused"] and restored and report.get("worker_completed") and len(gaps) > 15
+                            and report["trusted_ca_count"] > 0 and report["tls_verification_required"])
         output.write_text(json.dumps(report, indent=2), encoding="utf-8")
         window._quit()
     QTimer.singleShot(650, finish)

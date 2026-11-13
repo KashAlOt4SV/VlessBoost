@@ -13,6 +13,7 @@ import ipaddress
 import logging
 import os
 import socket
+import ssl
 from pathlib import Path
 import subprocess
 import threading
@@ -161,6 +162,41 @@ class AmneziaWGManager:
         self._lock = threading.RLock()
         self._endpoint_routes = []
         self.cancel_event = threading.Event()
+        self._transport_started_at = None
+        self.health_warning = None
+
+    def has_fresh_handshake(self, stats):
+        timestamp = stats.get("handshake") or 0
+        return bool(stats.get("alive") and (stats.get("rx") or 0) > 0
+                    and self._transport_started_at is not None
+                    and timestamp >= self._transport_started_at - 2
+                    and 0 <= time.time() - timestamp <= 180)
+
+    def check_health(self, port, *, timeout=6, stats=None):
+        started = time.monotonic()
+        try:
+            check_https_proxy(port, "one.one.one.one", timeout=timeout)
+        except ssl.SSLCertVerificationError as exc:
+            # TLS remains rejected. A separate authenticated AWG handshake can
+            # establish VPN readiness; it does not validate the HTTPS endpoint.
+            if not self.has_fresh_handshake(stats if stats is not None else self.telemetry()):
+                raise RuntimeError(
+                    "HTTPS-проверка: не удалось проверить сертификат. "
+                    "Свежий handshake AWG также не подтверждён. "
+                    "Проверьте дату Windows и журнал событий."
+                ) from exc
+            warning = ("Туннель AWG подтверждён, но сертификат HTTPS-проверки не прошёл проверку. "
+                       "Отклик HTTPS недоступен. Проверьте дату Windows, обновления сертификатов "
+                       "и HTTPS-фильтрацию антивируса.")
+            if not self.health_warning:
+                log.warning("HTTPS certificate rejected (code=%s, reason=%s); fresh AWG handshake and RX verified; tunnel retained",
+                            getattr(exc, "verify_code", None), getattr(exc, "verify_message", str(exc)))
+            self.health_warning = warning
+            return None
+        if self.health_warning:
+            log.info("HTTPS certificate verification recovered")
+        self.health_warning = None
+        return round((time.monotonic() - started) * 1000)
 
     def _check_cancelled(self):
         if self.cancel_event.is_set():
@@ -248,6 +284,7 @@ class AmneziaWGManager:
                          "*S-1-5-18:F", "*S-1-5-32-544:F"])
                 log.info("Starting official AmneziaWG 3.1 transport")
                 self._owned = True  # Roll back even if installation partially succeeds.
+                self._transport_started_at = time.time()
                 command([str(executable), "/installtunnelservice", str(PROFILE_PATH)])
                 self._check_cancelled()
                 powershell(
@@ -283,8 +320,8 @@ class AmneziaWGManager:
                         if powershell(route_script) == "created":
                             self._endpoint_routes.append((address + "/32", int(uplink["InterfaceIndex"])))
                 self.router.start(settings, kill_external=False, config=config)
-                # Readiness is an actual HTTPS round trip through AWG, not an open local port.
-                check_https_proxy(settings.socks_port, "one.one.one.one", timeout=12)
+                # Never confuse an open local port with a verified tunnel.
+                self.check_health(settings.socks_port, timeout=12)
                 self._check_cancelled()
                 self.active_settings = deepcopy(settings)
                 log.info("AmneziaWG tunnel verified; split routing active")
@@ -303,6 +340,8 @@ class AmneziaWGManager:
                            "Remove-NetRoute -Confirm:$false -ErrorAction Stop")
                 self._endpoint_routes.remove((prefix, index))
             self.active_settings = None
+            self._transport_started_at = None
+            self.health_warning = None
             log.info("VEIL tunnel disconnected")
 
     def telemetry(self):

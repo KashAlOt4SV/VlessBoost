@@ -14,8 +14,8 @@
 
 ## 2. Скачайте и запустите VEIL
 
-- **[Скачать VEIL 2.0.1 для Windows x64 - ZIP](https://github.com/KashAlOt4SV/VlessBoost/releases/download/v2.0.1/VEIL-2.0.1-windows-x64.zip)**
-- [Страница релиза на GitHub](https://github.com/KashAlOt4SV/VlessBoost/releases/tag/v2.0.1)
+- **[Скачать VEIL 2.0.2 для Windows x64 - ZIP](https://github.com/KashAlOt4SV/VlessBoost/releases/download/v2.0.2/VEIL-2.0.2-windows-x64.zip)**
+- [Страница релиза на GitHub](https://github.com/KashAlOt4SV/VlessBoost/releases/tag/v2.0.2)
 - [Эта инструкция в PDF](https://github.com/KashAlOt4SV/VlessBoost/releases/download/v2.0.1/VEIL-2.0.1-Quickstart-RU.pdf)
 
 Распакуйте **весь архив**, откройте папку `VEIL` и запустите `VEIL.exe`. Оставьте папки `_internal` и `bin` рядом с EXE. Подтвердите запрос Windows на права администратора: они нужны для сетевого адаптера.

@@ -78,3 +78,15 @@ class NativeUiTests(unittest.TestCase):
         event = QCloseEvent()
         self.window.closeEvent(event)
         self.assertTrue(event.isAccepted())
+
+    def test_verified_awg_with_tls_warning_is_visible_and_has_no_fake_latency(self):
+        manager = self.window.manager
+        manager.health_warning = "Туннель подтверждён, ошибка сертификата HTTPS"
+        manager.active_settings = Settings()
+        manager.running = True
+        self.window._tick = lambda: None
+        self.window._connected(None)
+        self.assertTrue(self.window.connected)
+        self.assertEqual(self.window.metric_values[0].text(), "—")
+        self.assertEqual(self.window.metric_notes[2].text(), "Handshake AWG подтверждён")
+        self.assertEqual(self.window.notice.text(), manager.health_warning)

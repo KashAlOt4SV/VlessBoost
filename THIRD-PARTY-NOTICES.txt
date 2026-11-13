@@ -17,6 +17,8 @@ Qt and PySide6 DLLs are distributed dynamically in _internal and may be replaced
 with compatible builds. This package does not statically link Qt.
 
 Python 3.11, Python Software Foundation: https://docs.python.org/3/license.html
+certifi 2026.10.23, Mozilla CA certificate bundle (MPL-2.0).
+Source and license: https://github.com/certifi/python-certifi/tree/2026.10.23
 PyInstaller: https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt
 
 This notices file does not replace the upstream license texts.

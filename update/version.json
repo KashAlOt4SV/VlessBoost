@@ -9,10 +9,10 @@
     "url": "https://github.com/KashAlOt4SV/VlessBoost/releases/download/v1.2.8/VLESS-Boost-windows.zip"
   },
   "veil_windows": {
-    "version": "2.0.1",
-    "url": "https://github.com/KashAlOt4SV/VlessBoost/releases/download/v2.0.1/VEIL-2.0.1-windows-x64.zip",
+    "version": "2.0.2",
+    "url": "https://github.com/KashAlOt4SV/VlessBoost/releases/download/v2.0.2/VEIL-2.0.2-windows-x64.zip",
     "manual_install": true,
     "protocol": "AmneziaWG 3.1"
   },
-  "updated": "2026-11-12T13:53:45Z"
+  "updated": "2026-11-13T15:27:41Z"
 }
